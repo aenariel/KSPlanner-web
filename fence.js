@@ -333,6 +333,15 @@
       // an outer fence's HQ or anchor never holds hive ground: should a hive banner come down by
       // mistake, it would take the ground and cut the hive apart
       if (k > 1 && (ownerOf(g.own[t]) === 0 || g.built[t])) return null;
+      // nor gains open ground next to the hive or a fence two or more in (a gap in the ring there)
+      if (k > 1 && g.own[t] === U) {
+        const x = t % g.W, y = (t / g.W) | 0;
+        for (const q of [x + 1 < g.W ? t + 1 : -1, x > 0 ? t - 1 : -1, y + 1 < g.H ? t + g.W : -1, y > 0 ? t - g.W : -1]) {
+          if (q < 0) continue;
+          const l = ownerOf(g.own[q]);
+          if (l >= 0 && l <= k - 2) return null;
+        }
+      }
       if (g.extraAt[t] >= 0) extras.add(g.extraAt[t]);
       if (R.has(t)) ring++;
       else if (g.own[t] === U) cost += g.cityBlock[t] || g.occ[t] ? 0.005 : 0.02;   // land beyond the ring
@@ -885,18 +894,43 @@
     const slack = [];
     byWin.forEach((a, q) => { if (a.length) { slack.push(q); L.push(" w" + (r++) + ": " + a.map((j) => "v" + j).join(" + ") + " + s" + q + " >= 1"); } else holes.push(wins[q]); });
     for (const a of byTile.values()) if (a.length > 1 && a.some((j) => cands[j].kind !== "banner")) L.push(" t" + (r++) + ": " + a.map((j) => "v" + j).join(" + ") + " <= 1");
-    // the fence closes: open ground reaching the outside that touches the hive's or an inner
-    // fence's territory must fall in a square of the last fence's (soft, like the 2x2s)
-    const inner = (o) => o !== U && ownerOf(o) >= 0 && ownerOf(o) < n;
+    // every ring closes and stays whole. Layers: hive 0, fence k, the outside n + 1. Open ground
+    // between layers j < k - 1 (a tile touching both, or touching layer j and open to the outside)
+    // must fall in a square of a layer between them (soft, like the 2x2s); and no filler may claim
+    // open ground next to a layer two or more away from its own unless a filler of a layer in
+    // between, built before it, claims it first.
+    const nbs = (t) => { const x = t % W, y = (t / W) | 0; return [x + 1 < W ? t + 1 : -1, x > 0 ? t - 1 : -1, y + 1 < H ? t + W : -1, y > 0 ? t - W : -1].filter((q) => q >= 0); };
+    const covers = (c, t) => c.kind === "banner" && Math.abs(c.x - t % W) <= 3 && Math.abs(c.y - ((t / W) | 0)) <= 3;
     const seal = [];
     for (let t = 0; t < g.N; t++) {
-      if (!outside[t]) continue;
-      const x = t % W, y = (t / W) | 0;
-      if (![x + 1 < W ? t + 1 : -1, x > 0 ? t - 1 : -1, y + 1 < H ? t + W : -1, y > 0 ? t - W : -1].some((q) => q >= 0 && inner(g.own[q]))) continue;
-      const js = [];
-      cands.forEach((c, j) => { if (c.kind === "banner" && c.owner === n && Math.abs(c.x - x) <= 3 && Math.abs(c.y - y) <= 3) js.push(j); });
-      seal.push(t);
-      L.push(" z" + (r++) + ": " + (js.length ? js.map((j) => "v" + j).join(" + ") + " + " : "") + "z" + t + " >= 1");
+      if (g.own[t] !== U) continue;
+      let lo = 99, hi = -1;
+      for (const q of nbs(t)) { const l = ownerOf(g.own[q]); if (l >= 0) { lo = Math.min(lo, l); hi = Math.max(hi, l); } }
+      if (outside[t]) hi = n + 1;
+      if (hi < 0) continue;
+      if (hi - lo >= 2) {
+        const js = [];
+        cands.forEach((c, j) => { if (c.owner > lo && c.owner < hi && covers(c, t)) js.push(j); });
+        seal.push(t);
+        L.push(" z" + (r++) + ": " + (js.length ? js.map((j) => "v" + j).join(" + ") + " + " : "") + "z" + t + " >= 1");
+      }
+      if (lo > n) continue;
+      // claims next to the layers found here: a layer two or more out needs an earlier claim in
+      // between; a layer two or more in would touch them first, so it may not claim the tile
+      const nearL = new Set(nbs(t).map((q) => ownerOf(g.own[q])).filter((l) => l >= 0));
+      const safe = [], risky = [];
+      cands.forEach((c, j) => {
+        if (!covers(c, t)) return;
+        let bad = false, early = false;
+        for (const l of nearL) { if (c.owner >= l + 2) bad = true; if (c.owner <= l - 2) early = true; }
+        if (early) L.push(" b" + (r++) + ": v" + j + " <= 0");
+        else if (bad) risky.push(j);
+        else safe.push(j);
+      });
+      if (risky.length) {
+        const ok = safe.filter((j) => [...nearL].every((l) => cands[j].owner <= l + 1));
+        L.push(" w" + (r++) + ": " + risky.map((j) => "v" + j).join(" + ") + (ok.length ? " - " + risky.length + " " + ok.map((j) => "v" + j).join(" - " + risky.length + " ") : "") + " <= 0");
+      }
     }
     for (let A = 0; A <= n; A++) for (const T of types) {
       const js = cands.map((c, j) => (c.owner === A && c.kind === T.type ? j : -1)).filter((j) => j >= 0);
@@ -1211,10 +1245,11 @@
      faster); its gain is kept per move. Each round prices every move not yet priced (one batch:
      they are independent) and takes the one that saves most; moves far from it keep their gain
      (priced again before they are taken), those near it or in later fences are priced again. The
-     final plan is designed once in full. A count of runs, not a clock, bounds the work, so every
-     machine gives the same plan. A generator: it yields batches of runs (see designSteps). */
+     final plan is designed once in full. Counts of runs, not a clock, bound the work (60 at most,
+     and it stops after 15 in a row that saved nothing), so every machine gives the same plan. A generator: it yields batches of runs (see designSteps). */
   function* pruneSteps(world, input, opts, highs, best, score, onProgress) {
-    const maxEvals = opts.pruneEvals || 60, maxTiles = opts.pruneTiles || 12, D = 16;
+    const maxEvals = opts.pruneEvals || 60, maxIdle = opts.pruneIdle || 15, maxTiles = opts.pruneTiles || 12, D = 16;
+    let lastGain = 0;   // stop after maxIdle runs in a row that saved nothing
     const n = best.fences.length;
     const key = (a) => a[0] + "," + a[1];
     const fixOf = (fences, k) => { const o = {}; for (const f of fences) if (f.k <= k) o[f.k] = { hq: f.hq, anchors: f.anchors }; return o; };
@@ -1268,9 +1303,10 @@
       });
       tick();
     };
-    while (evals < maxEvals) {
+    const budget = () => Math.min(maxEvals - evals, maxIdle - (evals - lastGain));
+    while (budget() > 0) {
       const moves = movesOf();
-      const fresh = moves.filter((m) => !cache.has(m.id)).slice(0, maxEvals - evals);
+      const fresh = moves.filter((m) => !cache.has(m.id)).slice(0, budget());
       if (fresh.length) yield* price(fresh);
       // the best move; one priced against an older plan is priced again first
       let taken = null;
@@ -1278,11 +1314,11 @@
         let bm = null, bg = 0;
         for (const m of moves) { const c = cache.get(m.id); if (c && c.gain > bg) { bg = c.gain; bm = m; } }
         if (!bm) break;
-        if (cache.get(bm.id).ver !== ver) { if (evals >= maxEvals) { cache.delete(bm.id); continue; } yield* price([bm]); continue; }
+        if (cache.get(bm.id).ver !== ver) { if (budget() <= 0) { cache.delete(bm.id); continue; } yield* price([bm]); continue; }
         taken = bm; break;
       }
-      if (!taken) { if (shifts || evals >= maxEvals) break; shifts = true; continue; }
-      P = cache.get(taken.id).plan; ver++; kept++;
+      if (!taken) { if (shifts || budget() <= 0) break; shifts = true; continue; }
+      P = cache.get(taken.id).plan; ver++; kept++; lastGain = evals;
       const near = (a) => Math.max(Math.abs(a[0] - taken.at[0]), Math.abs(a[1] - taken.at[1])) <= D;
       for (const [id] of cache) { const m = moves.find((u) => u.id === id); if (!m || m.k > taken.k || near(m.at)) cache.delete(id); }
     }
@@ -1645,6 +1681,62 @@
       if (!leaks.has(key)) leaks.set(key, (t % W + g.ox) + "," + (((t / W) | 0) + g.oy));
     }
     for (const [key, at] of leaks) errs.push("Fence open: " + key + " territory touches open ground outside at " + at);
+    // every ring whole: the hive's territory touches only fence 1's, fence k's only fence k-1's and
+    // k+1's (fence 2 touching the hive means fence 1 has a gap there)
+    const layer = new Map([[hive, 0]].concat(plan.fences.map((f) => [f.tag, f.k])));
+    const netAt = (t) => ownIdx[t] >= 0 && structs[ownIdx[t]].network;
+    const gaps = new Map();
+    for (let t = 0; t < N; t++) {
+      const a = layer.get(tagOf(t));
+      if (a === undefined || netAt(t)) continue;
+      for (const s of nb4(t)) {
+        if (s < 0 || netAt(s)) continue;
+        const b = layer.get(tagOf(s));
+        if (b === undefined || b < a + 2) continue;
+        const key = tagOf(t) + " touches " + tagOf(s);
+        if (!gaps.has(key)) gaps.set(key, (s % W + g.ox) + "," + (((s / W) | 0) + g.oy));
+      }
+    }
+    // a line of open ground between two layers that should not meet is a gap too
+    for (let t = 0; t < N; t++) {
+      if (tagOf(t) !== null || outside[t]) continue;
+      const ls = nb4(t).filter((s) => s >= 0 && !netAt(s)).map((s) => tagOf(s)).filter((o) => layer.has(o));
+      if (!ls.length) continue;
+      const lo = ls.reduce((a, o) => (layer.get(o) < layer.get(a) ? o : a)), hi = ls.reduce((a, o) => (layer.get(o) > layer.get(a) ? o : a));
+      if (layer.get(hi) - layer.get(lo) < 2) continue;
+      const key = lo + " touches " + hi + " across open ground";
+      if (!gaps.has(key)) gaps.set(key, (t % W + g.ox) + "," + (((t / W) | 0) + g.oy));
+    }
+    for (const [key, at] of gaps) errs.push("Ring broken: " + key + " at " + at);
+    // no free 2x2 shut in: every 2x2 of open, buildable, unoccupied tiles is plugged, but those
+    // wholly the last fence's (its ground beyond the ring) or open to the outside
+    const last = plan.fences.length ? plan.fences[plan.fences.length - 1].tag : hive;
+    // open ground that reaches the outside over other alliances' land too (a pocket against a
+    // neighbour is the neighbour's business, as for closure)
+    const open2 = new Uint8Array(N), q2 = [];
+    const pass = (t) => t >= 0 && (tagOf(t) === null || !layer.has(tagOf(t)));
+    for (let t = 0; t < N; t++) { const x = t % W, y = (t / W) | 0; if ((x === 0 || y === 0 || x === W - 1 || y === H - 1) && pass(t)) { open2[t] = 1; q2.push(t); } }
+    while (q2.length) for (const s of nb4(q2.pop())) if (pass(s) && !open2[s]) { open2[s] = 1; q2.push(s); }
+    const nearForeign = new Uint8Array(N);
+    for (let t = 0; t < N; t++) {
+      const o = tagOf(t);
+      if (o === null || layer.has(o)) continue;
+      const x = t % W, y = (t / W) | 0;
+      for (let yy = Math.max(0, y - 5); yy <= Math.min(H - 1, y + 4); yy++) for (let xx = Math.max(0, x - 5); xx <= Math.min(W - 1, x + 4); xx++) nearForeign[yy * W + xx] = 1;
+    }
+    let holes = 0, firstHole = null;
+    for (let y = 0; y < H - 1; y++) for (let x = 0; x < W - 1; x++) {
+      const ts = [y * W + x, y * W + x + 1, (y + 1) * W + x, (y + 1) * W + x + 1];
+      if (ts.some((t) => occ.has(t) || g.cityBlock[t] || open2[t] || netAt(t))) continue;
+      const tags = ts.map(tagOf);
+      if (tags.every((o) => o === last) || tags.some((o) => o !== null && !layer.has(o))) continue;
+      // near a neighbour's land (4 tiles): the neighbour's business for now, as for closure (the
+      // filler ILP leaves alone ground that reaches the outside over a neighbour's land)
+      if (nearForeign[ts[0]]) continue;
+      holes++;
+      if (!firstHole) firstHole = (x + g.ox) + "," + (y + g.oy);
+    }
+    if (holes) errs.push("Free 2x2 shut in: " + holes + " (first at " + firstHole + ")");
     if (probe) probe.tagAt = (x, y) => tagOf(idx(x, y));
     return [...new Set(errs)];
   }
