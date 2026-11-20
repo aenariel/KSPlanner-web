@@ -10,8 +10,8 @@
  * squares claim the ring (and define the fence's border); no anchor or HQ square may ever
  * hold a hive city, statue, node or banner tile, so nothing the hive needs can fall to the fence
  * if something is dismantled ("extra" cities of a design don't count: they are dropped if a
- * square needs their spot). Then fillers and the alliance's own buildings (2 traps, up to 5
- * statues, gathering node) plug every 2x2 in its territory; a second pass moves single fillers
+ * square needs their spot). Then fillers and the alliance's own buildings (2 traps, up to 3
+ * statues; no gathering node) plug every 2x2 in its territory; a second pass moves single fillers
  * off other banners and towards the cities, the count unchanged.
  *
  * Build order (whoever builds first owns the overlap):
@@ -306,6 +306,7 @@
   const SOFT = 3;
   const SOFT_TILE = 0.15;
   const HQ_OUT = 10;
+  const LAST_AREA = 0.0005;   // per tile of new ground the last fence's fillers claim (tie-break, above touching)
   const MAX_EXTRA_SECS = 31;
   const HIVE_BANNER = 2;   // a hive banner weighs two fence banners: the fences should pay
   function softTiles(g, k) {
@@ -1026,8 +1027,9 @@
       cands.push({ kind: "banner", owner: A, tiles: [t], x, y, w: 1, phase, orange: phase > Math.max(A, 1), grey: inHq && phase === A });
       }
     }
-    // the hive may also plug its spaces with statues (up to 3 in all, counting those it has)
-    const types = [{ type: "statue", w: 2, max: 5, hive: true, hiveMax: 3 }, { type: "node", w: 3, max: 1, hive: true }, { type: "trap", w: 3, max: 2, hive: false }];
+    // the hive may also plug its spaces with statues (up to 3 in all, counting those it has);
+    // each fence: up to 3 statues and its 2 traps, never a gathering node (max: per fence)
+    const types = [{ type: "statue", w: 2, max: 3, hive: true, hiveMax: 3 }, { type: "node", w: 3, max: 0, hive: true, hiveMax: 1 }, { type: "trap", w: 3, max: 2, hive: false }];
     const hiveHas = { statue: 0, node: 0 };
     for (const b of g.mother.buildings || []) hiveHas[b.type || (b.w === 3 ? "node" : "statue")]++;
     const hiveMax = (T) => T.hiveMax || T.max;
@@ -1035,6 +1037,7 @@
     for (const T of types) for (let y = 0; y + T.w <= H; y++) for (let x = 0; x + T.w <= W; x++) {
       const t0 = y * W + x, A = ownerOf(g.own[t0]);
       if (A < 0 || (A === 0 && (!T.hive || hiveHas[T.type] >= hiveMax(T)))) continue;
+      if (A > 0 && !T.max) continue;
       const mandatory = A === 0 && T.type === "statue";
       const tiles = [], extras = new Set();
       let ok = true, hits = false;
@@ -1060,7 +1063,7 @@
       cands.push({ kind: "city", owner: 0, tiles, x, y, w: 2, phase: 1 });
     }
     // the hive: an extra city first, then a statue (they are few), then a banner
-    const cost = (c) => (c.kind === "banner" ? (c.owner === 0 ? HIVE_BANNER : 1) + (c.orange ? 0.003 : 0) : c.kind === "city" ? 1.0005
+    const cost = (c) => (c.kind === "banner" ? (c.owner === 0 ? HIVE_BANNER : 1) + (c.orange && c.owner < n ? 0.003 : 0) : c.kind === "city" ? 1.0005
       : (c.owner === 0 && c.kind === "statue" ? 1.001 : 0.001) + 0.5 * (c.extras ? c.extras.length : 0));
     const L = ["Minimize", null, "Subject To"];
     let r = 0;
@@ -1120,13 +1123,47 @@
       crowd.push(b);
       L.push(" b" + (r++) + ": " + vs.map((j) => "v" + j).join(" + ") + " - e" + b + " <= " + (1 - f));
     }
-    // nearer the cities, but the last fence's oranges farther out (the wall reaches farther)
-    const near = (c) => (c.kind !== "banner" ? 0 : (c.owner === n && c.orange ? -1 : 1) * 0.00001 * Math.min(g.d[c.tiles[0]], 30));
-    L[1] = " obj: " + cands.map((c, j) => (cost(c) + near(c)).toFixed(5) + " v" + j).concat(slack.map((q) => "30 s" + q), crowd.map((b) => "0.0004 e" + b), seal.map((t) => "30 z" + t)).join(" + ");
+    // the last fence: as much new ground as its banners can claim (the wall reaches farther); a
+    // tile weighs a little more than a pair of touching banners, far less than a banner
+    const areaVars = [];
+    if (n > 0 && !opts.noTies) {
+      const claimBy = new Map();
+      cands.forEach((c, j) => {
+        if (c.kind !== "banner" || c.owner !== n) return;
+        const x = c.tiles[0] % W, y = (c.tiles[0] / W) | 0;
+        for (let yy = Math.max(0, y - 3); yy <= Math.min(H - 1, y + 3); yy++) for (let xx = Math.max(0, x - 3); xx <= Math.min(W - 1, x + 3); xx++) {
+          const t = yy * W + xx;
+          if (g.own[t] !== U || g.cityBlock[t]) continue;
+          let a = claimBy.get(t); if (!a) claimBy.set(t, a = []); a.push(j);
+        }
+      });
+      // the inner fences' fillers go up before the last fence's: ground they claim is not the last
+      // fence's (so they leave it what they can)
+      const preBy = new Map();
+      cands.forEach((c, j) => {
+        if (c.kind !== "banner" || c.owner < 1 || c.owner >= n) return;
+        const x = c.tiles[0] % W, y = (c.tiles[0] / W) | 0;
+        for (let yy = Math.max(0, y - 3); yy <= Math.min(H - 1, y + 3); yy++) for (let xx = Math.max(0, x - 3); xx <= Math.min(W - 1, x + 3); xx++) {
+          const t = yy * W + xx;
+          if (!claimBy.has(t)) continue;
+          let a = preBy.get(t); if (!a) preBy.set(t, a = []); a.push(j);
+        }
+      });
+      for (const [t, js] of claimBy) {
+        areaVars.push(t);
+        L.push(" a" + (r++) + ": g" + t + " - " + js.map((j) => "v" + j).join(" - ") + " <= 0");
+        for (const j of preBy.get(t) || []) L.push(" a" + (r++) + ": g" + t + " + v" + j + " <= 1");
+      }
+    }
+    // nearer the cities, but the last fence's fillers farther out
+    const near = (c) => (c.kind !== "banner" ? 0 : (c.owner === n ? -1 : 1) * 0.00001 * Math.min(g.d[c.tiles[0]], 30));
+    L[1] = " obj: " + cands.map((c, j) => (cost(c) + near(c)).toFixed(5) + " v" + j).concat(slack.map((q) => "30 s" + q), crowd.map((b) => "0.0004 e" + b), seal.map((t) => "30 z" + t)).join(" + ")
+      + areaVars.map((t) => " - " + LAST_AREA + " g" + t).join("");
     L.push("Bounds");
     for (const q of slack) L.push(" 0 <= s" + q + " <= " + (q === "st" ? hiveNeed : 1));
     for (const b of crowd) L.push(" e" + b + " >= 0");
     for (const t of seal) L.push(" 0 <= z" + t + " <= 1");
+    for (const t of areaVars) L.push(" 0 <= g" + t + " <= 1");
     L.push("Binary", " " + cands.map((c, j) => "v" + j).join(" "), "End");
     const sol = solveLP(highs, L, opts.fillTimeLimit || 90);
     if (!okStatus(sol)) throw new Error("The filler solver failed (" + (sol && sol.Status) + ").");
@@ -1166,9 +1203,18 @@
       }
       return n;
     };
-    // fewest banners touching; then nearer the cities, but the last fence's oranges farther out
+    // fewest banners touching; then nearer the cities, but the last fence's fillers farther out
+    // and claiming as much new ground as they can (a tile weighs a little more than a touching banner)
     const n = fences.length;
-    const score = (t, self, c) => 1000 * touch(t, self) + (c.owner === n && c.orange ? -g.d[t] : g.d[t]);
+    const pre = new Uint8Array(g.N);   // ground the inner fences' fillers claim first
+    const open = (t) => g.own[t] === U && !g.cityBlock[t] && !pre[t];
+    const claim = new Int32Array(g.N);   // the last fence's chosen banners covering each open tile
+    const sqTiles = (t, fn) => { const x = t % W, y = (t / W) | 0; for (let yy = Math.max(0, y - 3); yy <= Math.min(H - 1, y + 3); yy++) for (let xx = Math.max(0, x - 3); xx <= Math.min(W - 1, x + 3); xx++) fn(yy * W + xx); };
+    for (const j of sel) if (cands[j].kind === "banner" && cands[j].owner >= 1 && cands[j].owner < n) sqTiles(cands[j].tiles[0], (q) => { pre[q] = 1; });
+    for (const j of sel) if (cands[j].kind === "banner" && cands[j].owner === n) sqTiles(cands[j].tiles[0], (q) => { if (open(q)) claim[q]++; });
+    // ground claimed if the banner stood on s instead of t
+    const areaAt = (s, t) => { let a = 0; sqTiles(s, (q) => { if (open(q) && claim[q] - (Math.abs((q % W) - (t % W)) <= 3 && Math.abs(((q / W) | 0) - ((t / W) | 0)) <= 3 ? 1 : 0) === 0) a++; }); return a; };
+    const score = (t, self, c) => 1000 * touch(t, self) + (c.owner === n ? -1250 * areaAt(t, self) - g.d[t] : g.d[t]);
     let moved = 0;
     for (let pass = 0; pass < 8; pass++) {
       let any = false;
@@ -1185,12 +1231,14 @@
           if (taken[s] || g.occ[s] || !mine.every((w) => w.includes(s))) continue;
           const sc = score(s, t, c);
           if (sc >= bestS) continue;
-          for (const k of byTile.get(s) || []) { const d = cands[k]; if (d.owner === c.owner && d.phase <= c.phase && (!d.orange || c.orange)) { best = k; bestS = sc; break; } }
+          // an orange may become yellow, never the reverse (but in the last fence, whose oranges come last)
+          for (const k of byTile.get(s) || []) { const d = cands[k]; if (d.owner === c.owner && (c.owner === n || (d.phase <= c.phase && (!d.orange || c.orange)))) { best = k; bestS = sc; break; } }
         }
         if (best < 0) continue;
         const s = cands[best].tiles[0];
         for (const q of winsOf(t)) cov[q]--;
         for (const q of winsOf(s)) cov[q]++;
+        if (c.owner === n) { sqTiles(t, (q) => { if (open(q)) claim[q]--; }); sqTiles(s, (q) => { if (open(q)) claim[q]++; }); }
         taken[t] = ban[t] = 0; taken[s] = ban[s] = 1;
         sel.delete(j); sel.add(best);
         moved++; any = true;
@@ -1373,8 +1421,11 @@
 
   const runOne = (world, input, highs, o) => { try { return designOnce(world, input, o, highs, null); } catch (e) { if (o.log) o.log("run failed: " + e.message); return null; } };
 
+  /* Every layer given whole (HQ and anchors): nothing for the layouts or the iterations to vary. */
+  const allFixed = (opts) => { const n = opts.layers || 1; if (!opts.fixLayer) return false; for (let k = 1; k <= n; k++) if (!opts.fixLayer[k]) return false; return true; };
+
   function design(world, input, opts, highs, onProgress) {
-    if (opts.hqs || opts.outerHQ === true || opts.hqSearch === false) return designOnce(world, input, opts, highs, onProgress);
+    if (opts.hqs || opts.outerHQ === true || opts.hqSearch === false || allFixed(opts)) return designOnce(world, input, opts, highs, onProgress);
     const gen = designSteps(world, input, opts, highs, onProgress);
     let r = gen.next();
     while (!r.done) r = gen.next(r.value.map((o) => runOne(world, input, highs, o)));
@@ -1383,7 +1434,7 @@
 
   /* evaluate(list of options) -> Promise of plans (null for a failed run), in the same order. */
   async function designAsync(world, input, opts, highs, onProgress, evaluate) {
-    if (opts.hqs || opts.outerHQ === true || opts.hqSearch === false) return designOnce(world, input, opts, highs, onProgress);
+    if (opts.hqs || opts.outerHQ === true || opts.hqSearch === false || allFixed(opts)) return designOnce(world, input, opts, highs, onProgress);
     const gen = designSteps(world, input, opts, highs, onProgress);
     let r = gen.next();
     while (!r.done) r = gen.next(await evaluate(r.value));
