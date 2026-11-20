@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KSPlanner Hive Optimiser</title>
+<style>
+  :root { --bg:#14171c; --panel:#1d2129; --line:#2c323d; --text:#e6e8eb; --mute:#9aa3ae; --acc:#f5c542; --bt1:#3498db; --bt2:#e67e22; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
+  #app { display:grid; grid-template-columns: 330px 1fr; height:100%; }
+  #side { background:var(--panel); border-right:1px solid var(--line); overflow:auto; padding:14px; }
+  #mapwrap { position:relative; overflow:hidden; }
+  canvas#map { display:block; width:100%; height:100%; cursor:crosshair; touch-action:none; }
+  h1 { font-size:16px; margin:0 0 10px; color:var(--acc); }
+  h2 { font-size:13px; margin:16px 0 6px; color:var(--mute); text-transform:uppercase; letter-spacing:.05em; }
+  label { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:5px 0; color:var(--mute); }
+  input, select { background:#0f1216; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 7px; font:inherit; width:96px; }
+  .row { display:flex; gap:6px; align-items:center; }
+  .row input { width:70px; }
+  button { background:#2a3140; color:var(--text); border:1px solid #3a4352; border-radius:6px; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { background:#343c4d; }
+  button.primary { background:var(--acc); color:#1a1a1a; border-color:var(--acc); font-weight:600; width:100%; padding:9px; margin-top:8px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .msg { margin-top:8px; color:var(--mute); min-height:20px; }
+  .err { color:#ff7b72; }
+  .bar { height:12px; background:#0f1216; border:1px solid #2ecc71; border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:#2ecc71; transition:width .15s; }
+  .design { display:block; width:100%; text-align:left; margin:4px 0; }
+  .design.sel { outline:2px solid var(--acc); }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  td, th { padding:2px 4px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:var(--mute); font-weight:500; }
+  textarea { width:100%; height:110px; background:#0f1216; color:var(--text); border:1px solid var(--line); border-radius:6px; font:11px/1.3 ui-monospace, monospace; }
+  #lock.on { background:#f5c542; color:#111; }
+  label.check { justify-content:flex-start; gap:6px; }
+  label.check input { width:auto; }
+  #hover { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,.65); padding:4px 8px; border-radius:6px; font:12px ui-monospace, monospace; pointer-events:none; }
+  #zoom { position:absolute; right:8px; top:8px; display:flex; flex-direction:column; gap:4px; }
+  .legend { display:grid; grid-template-columns: 14px 1fr; gap:3px 6px; font-size:12px; color:var(--mute); align-items:center; }
+  .sw { width:12px; height:12px; border-radius:2px; }
+  .warn { color:#f0ad4e; }
+  .stats div { display:flex; justify-content:space-between; }
+  .stats span:first-child { color:var(--mute); }
+  .steps { font-size:12px; }
+  .steps details { margin:3px 0; }
+  .steps summary { cursor:pointer; }
+  details.sec { margin:12px 0 0; }
+  details.sec > summary { font-size:13px; font-weight:bold; color:var(--mute); text-transform:uppercase; letter-spacing:.05em; cursor:pointer; padding:4px 0; }
+  details.sec[open] > summary { margin-bottom:6px; }
+  .steps .co { color:var(--mute); font:11px/1.4 ui-monospace, monospace; word-break:break-word; }
+  @media (max-width: 760px) { #app { grid-template-columns: 1fr; grid-template-rows: 55vh auto; } #mapwrap { order:-1; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>Hive optimiser</h1>
+    <div class="msg" id="version">Version 2026.11.20.1</div>
+    <div class="msg" id="loadmsg">Loading map…</div>
+
+    <h2>Central point</h2>
+    <div class="row">X <input id="hx" type="number" min="0" max="1199"> Y <input id="hy" type="number" min="0" max="1199"> <button id="go">Set</button></div>
+    <div class="msg" id="hqmsg">Click the map or type coordinates. The HQ is placed at the best spot within the search radius of this point.</div>
+    <label class="check"><input id="fixhq" type="checkbox"> HQ exactly here (lower-left tile, as the game shows)</label>
+    <div class="row">BT1 X <input id="t1x" type="number" min="0" max="1199"> Y <input id="t1y" type="number" min="0" max="1199"></div>
+    <div class="row">BT2 X <input id="t2x" type="number" min="0" max="1199"> Y <input id="t2y" type="number" min="0" max="1199"></div>
+    <div class="msg">Trap positions (lower-left tile) are optional: fill one or both to keep them where they are; the cities and banners are designed around them.</div>
+
+    <h2>Settings</h2>
+    <label>Minimum cities (both traps) <input id="minCities" type="number" value="120" min="96" max="136" step="4"></label>
+    <label>HQ search radius <input id="radius" type="number" value="15" min="0" max="40"></label>
+    <label>1 banner is worth (s of avg march) <input id="bannerCost" type="number" value="0.1" min="0" max="2" step="0.05"></label>
+    <label>Centre tie-break window (s of avg march) <input id="centreTie" type="number" value="0.2" min="0" max="5" step="0.05"></label>
+    <label>Designs to show <input id="ndesigns" type="number" value="8" min="1" max="16"></label>
+    <label>Alliance tag (CSV) <input id="tag" type="text" value="HIVE"></label>
+    <button class="primary" id="run" disabled>Design hive</button>
+    <div class="bar"><div id="prog"></div></div>
+    <div class="msg" id="runmsg"></div>
+
+    <div id="results" hidden>
+      <details class="sec" open><summary>Layouts (best average first)</summary>
+      <div id="designs"></div></details>
+      <details class="sec" open><summary>Selected design</summary>
+      <div class="stats" id="stats"></div></details>
+      <details class="sec"><summary>KSMapper CSV</summary>
+      <textarea id="csv" readonly></textarea>
+      <div class="row" style="margin-top:6px"><button id="copy">Copy CSV</button><span class="msg" id="copymsg"></span></div></details>
+      <details class="sec"><summary>City slots</summary>
+      <table id="slots"></table></details>
+    </div>
+
+    <h2>Fences (step 2)</h2>
+    <label>Hive to fence <select id="fsrc" style="width:150px"><option value="design">Selected design</option><option value="csv">KSMapper CSV</option></select></label>
+    <div id="fcsvbox" hidden>
+      <textarea id="fcsv" placeholder="Paste a KSMapper CSV (type,X,Y,label,colour,...)"></textarea>
+      <label>Hive alliance tag <input id="fhive" type="text" value="" placeholder="e.g. ABC"></label>
+      <label>Tags to leave out (old fences) <input id="fignore" type="text" value="" placeholder="WAL,WL2"></label>
+    </div>
+    <label>Number of fences <input id="flayers" type="number" value="1" min="1" max="4"></label>
+    <label>Fence tags, inside out <input id="ftags" type="text" value="F1,F2,F3,F4"></label>
+    <label>Banner guideline per fence <input id="fcap" type="number" value="180" min="20" max="285"></label>
+    <div class="msg">Fence 1's anchors stand 4 tiles from the hive's cities (3 rows of 2x2); each later fence's right against the one before (2 new rows). Each fence plugs every free 2x2 inside its own territory.</div>
+    <button class="primary" id="frun" disabled>Design fences</button>
+    <div class="bar"><div id="fprog"></div></div>
+    <div class="msg" id="frunmsg"></div>
+    <div id="fresults" hidden>
+      <div class="stats" id="fstats"></div>
+      <details class="sec"><summary>Build order</summary>
+      <div id="fsteps" class="steps"></div></details>
+      <details class="sec"><summary>KSMapper CSV (fences and hive fillers)</summary>
+      <textarea id="fcsvout" readonly></textarea>
+      <div class="row" style="margin-top:6px"><button id="fcopy">Copy CSV</button><span class="msg" id="fcopymsg"></span></div></details>
+      <details class="sec"><summary>KSMapper CSV, complete (hive and fences, one build order)</summary>
+      <div class="msg">Import into an empty KSMapper map: the last column is the build order, and KSMapper gives each tile to whatever was built first.</div>
+      <textarea id="ffullout" readonly></textarea>
+      <div class="row" style="margin-top:6px"><button id="ffullcopy">Copy CSV</button><span class="msg" id="ffullcopymsg"></span></div></details>
+      <div class="row" style="margin-top:6px"><button id="fclear">Hide fences</button></div>
+    </div>
+
+    <details class="sec"><summary>Legend</summary>
+    <div class="legend">
+      <div class="sw" style="background:#8e44ad"></div><div>HQ</div>
+      <div class="sw" style="background:#c0392b"></div><div>Bear trap</div>
+      <div class="sw" style="background:#7f8c8d;border:1px solid #2c3e50"></div><div>Hive gathering node (3x3) / statue (2x2)</div>
+            <div class="sw" style="background:#2ecc71"></div><div>Banner</div>
+      <div class="sw" style="background:#3498db"></div><div>BT1 slot (core / <span style="color:#85c1e9">extra</span>)</div>
+      <div class="sw" style="background:#e67e22"></div><div>BT2 slot (core / <span style="color:#f5cba7">extra</span>)</div>
+            <div class="sw" style="background:rgba(245,197,66,.45)"></div><div>Territory (HQ + banners)</div>
+      <div class="sw" style="background:#ff0080"></div><div>Fence anchor (defines the fence's border)</div>
+      <div class="sw" style="background:#ffff00"></div><div>Filler (no new territory)</div>
+      <div class="sw" style="background:#ff8040"></div><div>Filler that expands territory (after the next fence's anchors, or last)</div>
+      <div class="sw" style="background:#c0c0c0"></div><div>Filler inside its own HQ territory</div>
+      <div class="sw" style="background:#ffff00;border:2px solid #145a32"></div><div>Hive filler (the hive's own free spaces)</div>
+      <div class="sw" style="background:#555;border:2px solid #00e5ff"></div><div>Hive banner to destroy and rebuild</div>
+      <div class="sw" style="background:#3498db;border:2px solid #ff3b30"></div><div>Extra city dropped for the fence</div>
+      <div class="sw" style="background:#85c1e9;border:2px solid #1b4f72"></div><div>Extra city instead of a hive filler (any march time)</div>
+      <div class="sw" style="background:linear-gradient(135deg,#111 35%,#3498db 35%)"></div><div>Where the city's banner goes if it is empty: a corner of the city, or a small square on the free tile beside it (red: the city needs two)</div>
+      <div class="sw" style="background:rgba(255,0,128,.25)"></div><div>Fence 1 territory (then violet, teal, brown)</div>
+      <div class="sw" style="background:rgb(128,116,100)"></div><div>Mountain</div>
+      <div class="sw" style="background:repeating-linear-gradient(45deg,#968c96 0 2px,#cec8ce 2px 6px)"></div><div>Other blocked ground</div>
+      <div class="sw" style="background:rgb(92,150,210)"></div><div>Lake</div>
+      <div class="sw" style="background:linear-gradient(90deg,#d6b43c 25%,#46823c 25% 50%,#969696 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
+      <div class="sw" style="background:#922b21"></div><div>Structure (no-build zone outlined)</div>
+      <div class="sw" style="background:#e2e7d2;border:1px solid #888"></div><div>Badlands (HQ allowed)</div>
+      <div class="sw" style="background:#c9dcb9"></div><div>Plains (HQ allowed)</div>
+      <div class="sw" style="background:#a9c79c"></div><div>Fertile (no HQ)</div>
+      <div class="sw" style="background:#d2b48c"></div><div>Ruins (no alliance buildings)</div>
+    </div></details>
+  </div>
+  <div id="mapwrap">
+    <canvas id="map"></canvas>
+    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="lock" title="Lock: clicks on the map no longer move the central point">Lock</button></div>
+    <div id="hover"></div>
+  </div>
+</div>
+<script src="hive.js"></script>
+<script src="fence.js"></script>
+<script src="page.js"></script>
+
+</body>
+</html>
