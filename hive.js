@@ -973,11 +973,13 @@
      for K banners around the HQ square) is rotated to each side of the HQ; clean pairs are kept,
      the best per banner budget go to an exact banner cover. Results sorted by average distance. */
   async function solve(world, cx, cy, opts, onProgress, highs) {
-    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 30, bannerCost: 0.1, centreTie: 0.2, symCost: 1 }, opts || {});
+    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 0, bannerCost: 0.1, centreTie: 0.2, symCost: 1 }, opts || {});
     // nearer the map's centre is better (Fertile Land gives cities a big bonus), but only as a
     // tie-break: the traps' mean distance to it (Chebyshev, like the zones)
     const centreDist = (traps) => traps.reduce((a, t) => a + Math.max(Math.abs(t[0] + 1.5 - 600), Math.abs(t[1] + 1.5 - 600)), 0) / traps.length;
-    const maxHits = opts.maxHits;
+    // without refits (the default: they cost a lot of time for ~1% of march time and symmetry) only
+    // clean clusters are kept, so the places per budget go to designs that can be built as they are
+    const maxHits = opts.refitMax ? opts.maxHits : 0;
     // `list` sorted by val: take the best left, every item within T of it, nearest the centre first
     const tieRank = (list, val, cen, T) => {
       const left = list.slice(), out = [];
@@ -1143,7 +1145,9 @@
     if (!positions.length) throw new Error("No valid HQ position within " + rad + " tiles of " + cx + "," + cy + ".");
     const best = new Map();   // banner budget -> list of {avg, hx, hy, A, B}
     const cap = opts.perBudget * 4;
-    const keep = (k, c) => {
+    // the best `cap` per budget, by estimate, then nearer the centre, then first found: a total
+    // order, so keeping a chunk's best first and merging them in scan order gives the same lists
+    const keeper = (best) => (k, c) => {
       let a = best.get(k);
       if (!a) best.set(k, a = []);
       const z = a[a.length - 1];
@@ -1152,38 +1156,63 @@
       a.sort((p, q) => p.avg - q.avg || p.cd - q.cd);   // equal estimates: nearer the centre kept
       if (a.length > cap) a.length = cap;
     };
+    const keep = keeper(best);
+    const hydrate = (c) => Object.assign(c, { A: variants[c.i], B: variants[c.j] });
+    // positions q0..q1-1; emit(k, candidate) with variants by index (plain data, for helper workers)
     const valid = new Uint8Array(variants.length);
-    for (let q = 0; q < positions.length; q++) {
-      const [hx, hy] = positions[q];
-      const ctx = makeContext(world, hx, hy, { radius: RAD });
-      const R = ctx.R, S = ctx.S;
-      for (const i of vids.concat(mids)) {
-        const v = variants[i];
-        const tx = R - v.off[0], ty = R - v.off[1];
-        let ok = tx >= 4 && ty >= 4 && tx + 6 < S && ty + 6 < S, hits = 0;
-        for (let y = 0; y < 3 && ok; y++) for (let x = 0; x < 3; x++) if (ctx.ally[(ty + y) * S + tx + x]) { ok = false; break; }
-        if (ok) for (let q = 0; q < v.pat.length; q++) {
-          const x = tx + v.pat[q][0], y = ty + v.pat[q][1];
-          if (x < 1 || y < 1 || x + 2 >= S || y + 2 >= S) { ok = false; break; }
-          const j = y * S + x;
-          if (ctx.city[j] || ctx.city[j + 1] || ctx.city[j + S] || ctx.city[j + S + 1]) {
-            if (v.inner[q] || ++hits > maxHits) { ok = false; break; }
+    const scanRange = async (q0, q1, emit, progress) => {
+      for (let q = q0; q < q1; q++) {
+        const [hx, hy] = positions[q];
+        let seq = 0;
+        const ctx = makeContext(world, hx, hy, { radius: RAD });
+        const R = ctx.R, S = ctx.S;
+        for (const i of vids.concat(mids)) {
+          const v = variants[i];
+          const tx = R - v.off[0], ty = R - v.off[1];
+          let ok = tx >= 4 && ty >= 4 && tx + 6 < S && ty + 6 < S, hits = 0;
+          for (let y = 0; y < 3 && ok; y++) for (let x = 0; x < 3; x++) if (ctx.ally[(ty + y) * S + tx + x]) { ok = false; break; }
+          if (ok) for (let q = 0; q < v.pat.length; q++) {
+            const x = tx + v.pat[q][0], y = ty + v.pat[q][1];
+            if (x < 1 || y < 1 || x + 2 >= S || y + 2 >= S) { ok = false; break; }
+            const j = y * S + x;
+            if (ctx.city[j] || ctx.city[j + 1] || ctx.city[j + S] || ctx.city[j + S + 1]) {
+              if (v.inner[q] || ++hits > maxHits) { ok = false; break; }
+            }
           }
+          valid[i] = ok ? hits + 1 : 0;
         }
-        valid[i] = ok ? hits + 1 : 0;
+        // free pairs under their banner budget; symmetric pairs apart (budget + 1000), so they are
+        // never crowded out by slightly better estimates (the symmetry is priced at the end)
+        for (const [i, j, mir] of compat.concat(mcompat)) {
+          if (!valid[i] || !valid[j]) continue;
+          const A = variants[i], B = variants[j];
+          if (forced.length && !forcedOK(hx, hy, A, B)) continue;
+          const hA = valid[i] - 1, hB = valid[j] - 1;
+          // each slot moved off an obstacle costs roughly 2 tiles of distance (estimate; re-fitted exactly later)
+          const avg = (A.m.N * A.m.avg + B.m.N * B.m.avg + 2 * (hA + hB)) / (A.m.N + B.m.N);
+          emit(A.m.K + B.m.K + (mir ? 1000 : 0), { avg, hx, hy, i, j, hA, hB, mir: mir || null, cd: centreDist([tpos(hx, hy, A), tpos(hx, hy, B)]), q, s: seq++ });
+        }
+        if (progress && (q % 4 === 0 || q === q1 - 1)) await progress(q);
       }
-      // free pairs under their banner budget; symmetric pairs apart (budget + 1000), so they are
-      // never crowded out by slightly better estimates (the symmetry is priced at the end)
-      for (const [i, j, mir] of compat.concat(mcompat)) {
-        if (!valid[i] || !valid[j]) continue;
-        const A = variants[i], B = variants[j];
-        if (forced.length && !forcedOK(hx, hy, A, B)) continue;
-        const hA = valid[i] - 1, hB = valid[j] - 1;
-        // each slot moved off an obstacle costs roughly 2 tiles of distance (estimate; re-fitted exactly later)
-        const avg = (A.m.N * A.m.avg + B.m.N * B.m.avg + 2 * (hA + hB)) / (A.m.N + B.m.N);
-        keep(A.m.K + B.m.K + (mir ? 1000 : 0), { avg, hx, hy, A, B, hA, hB, mir, cd: centreDist([tpos(hx, hy, A), tpos(hx, hy, B)]) });
-      }
-      if (onProgress && (q % 4 === 0 || q === positions.length - 1)) { onProgress({ stage: "hq", frac: (q + 1) / positions.length, found: best.size }); await tick(); }
+    };
+    // a helper worker's share: its chunk's best per budget, in scan order
+    if (opts.scanRange) {
+      const mine = new Map();
+      await scanRange(opts.scanRange[0], opts.scanRange[1], keeper(mine), null);
+      return [...mine].flatMap(([k, a]) => a.map((c) => Object.assign(c, { k }))).sort((a, b) => a.q - b.q || a.s - b.s);
+    }
+    if (opts.scanPool && positions.length >= 64) {
+      // spread over the helper workers in chunks; merged in scan order (same lists as one worker)
+      // two chunks per helper: each chunk repeats the set-up (~0.4 s), so few large ones
+      const n = Math.max(1, Math.min(Math.ceil(positions.length / 32), 2 * (opts.scanPool.size || 4))), jobs = [];
+      for (let c = 0; c < n; c++) jobs.push([Math.floor((c * positions.length) / n), Math.floor(((c + 1) * positions.length) / n)]);
+      let doneJobs = 0;
+      const res = await opts.scanPool(jobs, () => { if (onProgress) onProgress({ stage: "hq", frac: ++doneJobs / jobs.length, found: 0 }); });
+      for (const c of res.flat().sort((a, b) => a.q - b.q || a.s - b.s)) keep(c.k, hydrate(c));
+    } else {
+      await scanRange(0, positions.length, (k, c) => keep(k, hydrate(c)), async (q) => {
+        if (onProgress) { onProgress({ stage: "hq", frac: (q + 1) / positions.length, found: best.size }); await tick(); }
+      });
     }
 
     // 3. exact banner cover for the best per budget (distinct HQ + trap pairs)

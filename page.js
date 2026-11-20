@@ -525,6 +525,7 @@ $("run").onclick = () => {
     designs: +$("ndesigns").value || 4, tag: $("tag").value || "HIVE",
   };
   if ($("fixhq").checked) opts.radius = 0;
+  opts.refitMax = $("refit").checked ? 30 : 0;
   const trap = (a, b) => { const x = parseInt($(a).value, 10), y = parseInt($(b).value, 10); return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null; };
   opts.traps = [trap("t1x", "t1y"), trap("t2x", "t2y")];
   const t0 = Date.now();
