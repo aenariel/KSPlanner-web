@@ -53,6 +53,7 @@
   const sqB = (x, y) => [x - 3, y - 3, x + 3, y + 3];
   const sqH = (x, y) => [x - 6, y - 6, x + 8, y + 8];
   const inR = (r, x, y) => x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3];
+  const hitsMask = (g, r, mask) => { for (let y = Math.max(0, r[1]); y <= Math.min(g.H - 1, r[3]); y++) for (let x = Math.max(0, r[0]); x <= Math.min(g.W - 1, r[2]); x++) if (mask[y * g.W + x]) return true; return false; };
   const touches = (a, b) => Math.max(a[0], b[0]) - Math.min(a[2], b[2]) <= 1 && Math.max(a[1], b[1]) - Math.min(a[3], b[3]) <= 1;
 
   /* Splits the mother alliance's banners into hive banners (square holds a city, trap, statue,
@@ -332,16 +333,9 @@
       if (k === 1 && g.built[t] && !g.hqSq(t)) return null;
       // an outer fence's HQ or anchor never holds hive ground: should a hive banner come down by
       // mistake, it would take the ground and cut the hive apart
-      if (k > 1 && (ownerOf(g.own[t]) === 0 || g.built[t])) return null;
-      // nor gains open ground next to the hive or a fence two or more in (a gap in the ring there)
-      if (k > 1 && g.own[t] === U) {
-        const x = t % g.W, y = (t / g.W) | 0;
-        for (const q of [x + 1 < g.W ? t + 1 : -1, x > 0 ? t - 1 : -1, y + 1 < g.H ? t + g.W : -1, y > 0 ? t - g.W : -1]) {
-          if (q < 0) continue;
-          const l = ownerOf(g.own[q]);
-          if (l >= 0 && l <= k - 2) return null;
-        }
-      }
+      // once the build order is tracked (g.reg), banner ground the hive can destroy and rebuild in
+      // place (cycleHive checks it) and the hive HQ's own ground (it never falls) are fine
+      if (k > 1 && (g.built[t] || (ownerOf(g.own[t]) === 0 && (!g.reg || g.prot[t])))) return null;
       if (g.extraAt[t] >= 0) extras.add(g.extraAt[t]);
       if (R.has(t)) ring++;
       else if (g.own[t] === U) cost += g.cityBlock[t] || g.occ[t] ? 0.005 : 0.02;   // land beyond the ring
@@ -404,7 +398,7 @@
       // on open ground or on the fence's own (its HQ's square): a banner may stand on either
       // only on ground free at this step (or the fence's own): never on the hive's land, which
       // stands until the hive rebuilds
-      if (!dil[p] || (g.own[p] !== U && g.own[p] !== F0 + k) || g.allyBlock[p] || g.occ[p]) continue;
+      if (!dil[p] || (g.own[p] !== U && g.own[p] !== F0 + k) || g.allyBlock[p] || g.occ[p] || (g.noAnchor && g.noAnchor.has(p))) continue;
       const x = p % W, y = (p / W) | 0, r = sqB(x, y);
       if (hitsResFoot(r)) continue;
       // anchors define the border: they stand on the line 4 tiles beyond the inner region (their
@@ -439,7 +433,7 @@
     }
     const picked = [];
     const hqRule = (x, y, r) => { if (!squareInfo(g, r, k, R, keepCost)) throw new Error("Fence " + k + ": an HQ at " + (x + g.ox) + "," + (y + g.oy) + " would hold " + (k === 1 ? "something the hive built" : "hive ground") + "."); };
-    if (fixed) { hqRule(fixed.x, fixed.y, fixed.r); picked.push(Object.assign({}, fixed, { kind: "h", cost: 0, extras: [] })); }
+    if (fixed) { if (!fixed.placed) hqRule(fixed.x, fixed.y, fixed.r); picked.push(Object.assign({}, fixed, { kind: "h", cost: 0, extras: [] })); }
     else if (fixL) {
       const x = fixL.hq[0] - g.ox, y = fixL.hq[1] - g.oy, r = sqH(x, y);
       hqRule(x, y, r);
@@ -460,7 +454,11 @@
     const cons = [], obj = [];
     // fence 1: wherever its square covers most (the line 4 tiles out is only a tie-break); later
     // fences: right against the fence before, 2 per tile off
-    const costOf = vars.map((v) => (v.kind === "a" ? 1 + (k === 1 ? 0.05 : 2) * v.off : 0) + v.cost);
+    // opts.noise (a seed): small random costs per anchor, so the solver picks another layout among the
+    // (near) ties; the same seed gives the same layout on any machine
+    let seed = ((opts.noise | 0) * 7919 + k * 104729) % 2147483648;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const costOf = vars.map((v) => (v.kind === "a" ? 1 + (k === 1 ? 0.05 : 2) * v.off + (opts.noise ? 0.3 * rnd() : 0) : 0) + v.cost);
     vars.forEach((v, j) => obj.push("+ " + costOf[j].toFixed(4) + " " + name(j)));
     const xs = new Set();
     vars.forEach((v, j) => { for (const c of v.extras) { xs.add(c); cons.push(name(j) + " - x" + c + " <= 0"); } });
@@ -778,6 +776,190 @@
     return { order: res.anchors.slice(), dropped: [...dropped] };
   }
 
+  /* Who owns what, in build order (the game's rule: a tile belongs to the earliest-built standing HQ
+     or banner that covers it). Set up once fence 1 and the hive's rebuild stand; later HQs, anchors,
+     removals and the hive's destroy-and-rebuild cycles go through it, so freed ground goes where the
+     game would send it. */
+  function buildReg(g, input, fences, log) {
+    const reg = [];
+    const add = (code, r, kind, at) => { reg.push({ code, r, kind, at, alive: true }); return reg.length - 1; };
+    const D = new Set((g.destroyed || []).map(String));
+    add(M_HQ, sqH(g.mother.hq[0] - g.ox, g.mother.hq[1] - g.oy), "hq", g.mother.hq);
+    for (const b of g.split.hive) if (!D.has(String(b))) add(M_BAN, sqB(b[0] - g.ox, b[1] - g.oy), "banner", b);
+    for (const h of input.others.hqs) add(OTHER, sqH(h[0] - g.ox, h[1] - g.oy), "other");
+    for (const b of input.others.banners.concat(g.split.network)) add(OTHER, sqB(b[0] - g.ox, b[1] - g.oy), "other");
+    for (const f of fences) { f.hq.reg = add(F0 + f.k, f.hq.r, "hq"); for (const a of f.anchors) a.reg = add(F0 + f.k, a.r, "anchor"); }
+    for (const b of g.rebuilt || []) add(M_BAN, sqB(b[0] - g.ox, b[1] - g.oy), "banner", b);
+    g.reg = reg;
+    g.regOwner = new Int32Array(g.N).fill(-1);
+    const before = g.own.slice();
+    regPaint(g, [0, 0, g.W - 1, g.H - 1]);
+    let diff = 0;
+    for (let t = 0; t < g.N; t++) if (before[t] !== g.own[t]) diff++;
+    if (diff && log) log("build-order ownership differs from the running grid on " + diff + " tile(s)");
+  }
+
+  function regPaint(g, r) {
+    const { W, H } = g;
+    for (let y = Math.max(0, r[1]); y <= Math.min(H - 1, r[3]); y++) for (let x = Math.max(0, r[0]); x <= Math.min(W - 1, r[2]); x++) {
+      const t = y * W + x;
+      let o = -1;
+      for (let i = 0; i < g.reg.length; i++) { const e = g.reg[i]; if (e.alive && inR(e.r, x, y)) { o = i; break; } }
+      g.regOwner[t] = o;
+      g.own[t] = o < 0 ? U : g.reg[o].code;
+    }
+  }
+
+  function snapG(g, fences) {
+    return { own: g.own.slice(), occ: g.occ.slice(), extraAt: g.extraAt.slice(), regOwner: g.regOwner.slice(), alive: g.reg.map((e) => e.alive), n: g.reg.length, anchors: fences.map((f) => f.anchors) };
+  }
+  function restoreG(g, s, fences) {
+    // copies: the same snapshot may be restored more than once
+    g.own = s.own.slice(); g.occ = s.occ.slice(); g.extraAt = s.extraAt.slice(); g.regOwner = s.regOwner.slice();
+    g.reg.length = s.n; g.reg.forEach((e, i) => { e.alive = s.alive[i]; });
+    fences.forEach((f, i) => { if (i < s.anchors.length) f.anchors = s.anchors[i]; });
+  }
+
+  /* The hive destroys, one at a time, each standing banner that owns ground inside `rects` (outside
+     its HQ's square, which never falls) and rebuilds it in place: the squares already standing take
+     the freed ground first. Fails if a hive city, statue, node or banner tile ends up outside the
+     hive's ground, or a banner's own tile falls to someone else. Extra cities that lose ground are
+     dropped. */
+  function cycleHive(g, rects) {
+    const { W, H } = g;
+    const hqR = sqH(g.mother.hq[0] - g.ox, g.mother.hq[1] - g.oy);
+    const cycled = [], dropped = [], freed = [];
+    const hiveOwn = (t) => g.own[t] === M_BAN || g.own[t] === M_HQ;
+    for (let guard = 0; guard < 60; guard++) {
+      let pick = -1;
+      for (const r of rects) {
+        for (let y = Math.max(0, r[1]); y <= Math.min(H - 1, r[3]) && pick < 0; y++) for (let x = Math.max(0, r[0]); x <= Math.min(W - 1, r[2]); x++) {
+          if (inR(hqR, x, y)) continue;
+          const o = g.regOwner[y * W + x];
+          if (o >= 0 && g.reg[o].code === M_BAN) { pick = o; break; }
+        }
+        if (pick >= 0) break;
+      }
+      if (pick < 0) break;
+      const e = g.reg[pick], at = e.at;
+      e.alive = false;
+      regPaint(g, e.r);
+      const bt = g.idx(at[0], at[1]);
+      if (bt < 0 || !(g.own[bt] === U || hiveOwn(bt))) return { ok: false, why: "the hive could not rebuild its banner " + at.join(",") + " (its tile went to another alliance)", bad: e.r };
+      g.reg.push({ code: M_BAN, r: e.r, kind: "banner", at, alive: true });
+      regPaint(g, e.r);
+      cycled.push(at.slice());
+      for (let y = Math.max(0, e.r[1]); y <= Math.min(H - 1, e.r[3]); y++) for (let x = Math.max(0, e.r[0]); x <= Math.min(W - 1, e.r[2]); x++) {
+        const t = y * W + x;
+        if (hiveOwn(t)) continue;
+        if (g.prot[t]) return { ok: false, why: "the hive would lose " + (x + g.ox) + "," + (y + g.oy) + " when it rebuilds " + at.join(","), bad: e.r };
+        freed.push(t);
+        if (g.extraAt[t] >= 0) {
+          const n = g.extraAt[t], c = g.mother.cities[n];
+          dropped.push(n);
+          for (let j = 0; j < 2; j++) for (let i = 0; i < 2; i++) { const s = g.idx(c[0] + i, c[1] + j); if (s >= 0) { g.occ[s] = 0; g.extraAt[s] = -1; } }
+        }
+      }
+    }
+    return { ok: true, cycled, dropped, freed };
+  }
+
+  /* Every alliance whose ring a new HQ cut (the hive and the fences before k) must stay chained to
+     its HQ (KSMapper's rule: each banner's square holds a cell linked, 8-adjacent, to the HQ's).
+     Returns what broke, or null. */
+  function chainBroken(g, fences, k) {
+    const { W, H, N } = g;
+    const groups = [{ name: g.mother.tag, codes: [M_HQ, M_BAN], hq: 0, members: g.reg.filter((e) => e.alive && e.code === M_BAN).map((e) => e.r) }]
+      .concat(fences.filter((f) => f.k < k && f.hq.reg >= 0).map((f) => ({ name: "Fence " + f.k, codes: [F0 + f.k], hq: f.hq.reg, members: f.anchors.map((a) => a.r) })));
+    for (const G of groups) {
+      const seen = new Uint8Array(N), q = [];
+      for (let t = 0; t < N; t++) if (g.regOwner[t] === G.hq) { seen[t] = 1; q.push(t); }
+      while (q.length) {
+        const t = q.pop(), x = t % W, y = (t / W) | 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const s = yy * W + xx;
+          if (!seen[s] && G.codes.includes(g.own[s])) { seen[s] = 1; q.push(s); }
+        }
+      }
+      for (const r of G.members) {
+        let ok = false;
+        for (let y = Math.max(0, r[1]); y <= Math.min(H - 1, r[3]) && !ok; y++) for (let x = Math.max(0, r[0]); x <= Math.min(W - 1, r[2]); x++) if (seen[y * W + x]) { ok = true; break; }
+        if (!ok) return G.name + " would have a banner cut off from its HQ";
+      }
+    }
+    return null;
+  }
+
+  /* Fence k's HQ at x,y (grid), built after the fences before it: their banners whose square touches
+     its 3x3 come down first; the HQ goes up; the hive destroys and rebuilds in place each banner
+     whose ground the HQ's square needs; every ring it cut must still chain to its HQ. On failure the
+     grid is left as it was. */
+  function placeHQ(g, k, fences, x, y) {
+    const s = snapG(g, fences);
+    const fail = (why) => { restoreG(g, s, fences); return { ok: false, why }; };
+    const foot = [];
+    for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) foot.push([x + i, y + j]);
+    if (foot.some(([a, b]) => a < 0 || b < 0 || a >= g.W || b >= g.H)) return fail("off the map window");
+    const removed = [];
+    for (const f of fences) {
+      if (f.k >= k) continue;
+      const out = f.anchors.filter((a) => foot.some(([a2, b2]) => inR(a.r, a2, b2)));
+      if (!out.length) continue;
+      f.anchors = f.anchors.filter((a) => !out.includes(a));
+      for (const a of out) { g.reg[a.reg].alive = false; g.occ[a.p] = 0; regPaint(g, a.r); removed.push({ k: f.k, x: a.x, y: a.y }); }
+    }
+    for (const [a, b] of foot) { const t = b * g.W + a; if (g.own[t] !== U || g.occ[t] || g.hqBlock[t]) return fail("its 3x3 is not open ground"); }
+    const r = sqH(x, y);
+    for (let yy = Math.max(0, r[1]); yy <= Math.min(g.H - 1, r[3]); yy++) for (let xx = Math.max(0, r[0]); xx <= Math.min(g.W - 1, r[2]); xx++) { const t = yy * g.W + xx; if (g.built[t] && !g.hqSq(t)) return fail("its square holds a hive building"); }
+    const hqReg = g.reg.length;
+    g.reg.push({ code: F0 + k, r, kind: "hq", alive: true });
+    regPaint(g, r);
+    for (const [a, b] of foot) g.occ[b * g.W + a] = 1;
+    const cyc = cycleHive(g, [r]);
+    if (!cyc.ok) return fail(cyc.why);
+    const cut = chainBroken(g, fences, k);
+    if (cut) return fail(cut);
+    return { ok: true, hqReg, removed, cycled: cyc.cycled, dropped: cyc.dropped, freed: cyc.freed, foot: foot.map(([a, b]) => b * g.W + a) };
+  }
+
+  /* Where fence k's HQ may go, best first: squares overlapping most of the HQ squares already up (the
+     hive's and the fences' before k), so the HQ adds the least new ground. Its 3x3 on open ground (or
+     on ground of an earlier fence's anchors, which come down), its square holding nothing the hive
+     built outside the hive HQ's square. k = 1 overlaps the hive HQ only. */
+  function hqCandidates(g, k, fences) {
+    const { W, H } = g;
+    const hiveR = sqH(g.mother.hq[0] - g.ox, g.mother.hq[1] - g.oy);
+    const rects = [hiveR].concat(fences.filter((f) => f.k < k).map((f) => f.hq.r));
+    const anchorTile = new Set();
+    for (const f of fences) if (f.k < k) for (const a of f.anchors) anchorTile.add(a.p);
+    const seen = new Set(), out = [];
+    for (const R of rects) for (let y = Math.max(0, R[1] - 8); y <= Math.min(H - 3, R[3] + 6); y++) for (let x = Math.max(0, R[0] - 8); x <= Math.min(W - 3, R[2] + 6); x++) {
+      const key = y * W + x;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let ok = true;
+      for (let j = 0; j < 3 && ok; j++) for (let i = 0; i < 3; i++) {
+        const t = (y + j) * W + x + i, o = g.own[t];
+        if (g.hqBlock[t] || !(o === U || (k > 1 && o > F0 && o - F0 < k)) || (g.occ[t] && !anchorTile.has(t))) { ok = false; break; }
+      }
+      if (!ok) continue;
+      const r = sqH(x, y);
+      if (r[0] < 0 || r[1] < 0 || r[2] >= W || r[3] >= H) continue;
+      let ov = 0;
+      for (let yy = r[1]; yy <= r[3] && ok; yy++) for (let xx = r[0]; xx <= r[2]; xx++) {
+        const t = yy * W + xx;
+        if (g.built[t] && !g.hqSq(t)) { ok = false; break; }
+        if (rects.some((q) => inR(q, xx, yy))) ov++;
+      }
+      if (!ok || !ov) continue;
+      const d = Math.max(Math.abs(x + 1 - (hiveR[0] + 7)), Math.abs(y + 1 - (hiveR[1] + 7)));
+      out.push({ x, y, ov, d });
+    }
+    return out.sort((a, b) => b.ov - a.ov || a.d - b.d || a.y - b.y || a.x - b.x);
+  }
+
   /* Ground open to the outside right after fence A's anchors, before the next fence's: open ground,
      and later fences' land not yet built (their HQs built first excepted), linked to the window's
      edge. A fence banner whose square gains any of it would push the fence outward: orange. */
@@ -838,6 +1020,9 @@
       // a fence banner is orange only if it would push the fence outward (ground it gains in a
       // pocket already shut in leaves it yellow)
       const phase = A === 0 ? (gain ? 1 : Math.max(later, 1)) : out ? Math.max(A + 1, later) : Math.max(later, A);
+      // fence A's fillers go up after fence A+1's anchors: none may claim the 3x3 of a later HQ, or
+      // ground a later cycle of the hive frees for a later fence, before that fence is up
+      if (A >= 1 && (g.later || []).some((L) => L.k >= A + 2 && hitsMask(g, sqB(x, y), L.mask))) continue;
       cands.push({ kind: "banner", owner: A, tiles: [t], x, y, w: 1, phase, orange: phase > Math.max(A, 1), grey: inHq && phase === A });
       }
     }
@@ -894,11 +1079,9 @@
     const slack = [];
     byWin.forEach((a, q) => { if (a.length) { slack.push(q); L.push(" w" + (r++) + ": " + a.map((j) => "v" + j).join(" + ") + " + s" + q + " >= 1"); } else holes.push(wins[q]); });
     for (const a of byTile.values()) if (a.length > 1 && a.some((j) => cands[j].kind !== "banner")) L.push(" t" + (r++) + ": " + a.map((j) => "v" + j).join(" + ") + " <= 1");
-    // every ring closes and stays whole. Layers: hive 0, fence k, the outside n + 1. Open ground
-    // between layers j < k - 1 (a tile touching both, or touching layer j and open to the outside)
-    // must fall in a square of a layer between them (soft, like the 2x2s); and no filler may claim
-    // open ground next to a layer two or more away from its own unless a filler of a layer in
-    // between, built before it, claims it first.
+    // every inner layer is shut in. Layers: hive 0, fence k, the outside n + 1. Open ground that
+    // touches layer j and is open to the outside must fall in a square of a later layer (soft, like
+    // the 2x2s). Layers may otherwise meet (no ring rule): only closure and the 2x2s count.
     const nbs = (t) => { const x = t % W, y = (t / W) | 0; return [x + 1 < W ? t + 1 : -1, x > 0 ? t - 1 : -1, y + 1 < H ? t + W : -1, y > 0 ? t - W : -1].filter((q) => q >= 0); };
     const covers = (c, t) => c.kind === "banner" && Math.abs(c.x - t % W) <= 3 && Math.abs(c.y - ((t / W) | 0)) <= 3;
     const seal = [];
@@ -906,30 +1089,13 @@
       if (g.own[t] !== U) continue;
       let lo = 99, hi = -1;
       for (const q of nbs(t)) { const l = ownerOf(g.own[q]); if (l >= 0) { lo = Math.min(lo, l); hi = Math.max(hi, l); } }
-      if (outside[t]) hi = n + 1;
-      if (hi < 0) continue;
-      if (hi - lo >= 2) {
+      if (!outside[t] || lo >= n) continue;   // the last fence may meet the outside
+      hi = n + 1;
+      {
         const js = [];
         cands.forEach((c, j) => { if (c.owner > lo && c.owner < hi && covers(c, t)) js.push(j); });
         seal.push(t);
         L.push(" z" + (r++) + ": " + (js.length ? js.map((j) => "v" + j).join(" + ") + " + " : "") + "z" + t + " >= 1");
-      }
-      if (lo > n) continue;
-      // claims next to the layers found here: a layer two or more out needs an earlier claim in
-      // between; a layer two or more in would touch them first, so it may not claim the tile
-      const nearL = new Set(nbs(t).map((q) => ownerOf(g.own[q])).filter((l) => l >= 0));
-      const safe = [], risky = [];
-      cands.forEach((c, j) => {
-        if (!covers(c, t)) return;
-        let bad = false, early = false;
-        for (const l of nearL) { if (c.owner >= l + 2) bad = true; if (c.owner <= l - 2) early = true; }
-        if (early) L.push(" b" + (r++) + ": v" + j + " <= 0");
-        else if (bad) risky.push(j);
-        else safe.push(j);
-      });
-      if (risky.length) {
-        const ok = safe.filter((j) => [...nearL].every((l) => cands[j].owner <= l + 1));
-        L.push(" w" + (r++) + ": " + risky.map((j) => "v" + j).join(" + ") + (ok.length ? " - " + risky.length + " " + ok.map((j) => "v" + j).join(" - " + risky.length + " ") : "") + " <= 0");
       }
     }
     for (let A = 0; A <= n; A++) for (const T of types) {
@@ -1166,54 +1332,41 @@
     return picked.map((c) => [c.x + g.ox, c.y + g.oy]);
   }
 
-  /* Fences round the hive. Unless the HQs are given (opts.hqs) or the old rule is asked for
-     (opts.outerHQ), several HQ placements are designed end to end and the plan with the fewest
-     banners kept (rule errors and open spaces first): fence 1's HQ at the anchor ILP's choice and at
-     the best other spots; fence 2's at its own turn, or built first across both bands. */
+  /* Fences round the hive. Each fence's HQ goes where its square overlaps most of the HQ squares
+     already up (placeHQ); the anchors around it are an exact ILP that counts anchors, not the fillers
+     they will need, so several anchor layouts (opts.layouts, 16 by default: seeded tie-breaks, the
+     same on any machine) are designed end to end; the iterations (removals only) then start from the
+     two best, and the plan with the fewest banners is kept (rule errors and open spaces first). */
   /* The design search runs as a generator: it yields batches of independent end-to-end runs (each
      an options object for designOnce) and gets their plans back (null where a run failed). design()
      runs them one after the other; designAsync() hands each batch to an evaluator, e.g. a pool of
      workers. The batches and their order are the same either way, so both give the same plan. */
   function* designSteps(world, input, opts, highs, onProgress) {
-    const layers = Math.max(1, Math.min(4, opts.layers | 0 || 1));
     // banners spent: fences, hive fillers and the hive's net change of banners in the rebuild
     const total = (p) => p.fences.reduce((a, f) => a + f.banners, 0) + p.hive.banners.length + p.rebuild.length - (p.destroy || []).length;
     // the plan kept: fewest banners, a hive banner counting HIVE_BANNER (the fences should pay)
     const score = (p) => p.fences.reduce((a, f) => a + f.banners, 0) + HIVE_BANNER * (p.hive.banners.length + p.rebuild.length - (p.destroy || []).length);
     const worse = (a, b) => a.errors.length - b.errors.length || a.holes.length - b.holes.length || score(a) - score(b);
-    const maxRuns = opts.hqTries || 12;
     const prog = (stage, frac) => { if (onProgress) onProgress({ stage, frac }); };
-    prog("hq search", 0);
-    const base = designOnce(world, input, opts, highs, null);
-    const tried = [{ plan: base, label: "fence 1 HQ " + base.fences[0].hq.join(",") }];
-    const far = (a, b) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1])) >= 4;
-    const f1 = [base.fences[0].hq];
-    for (const c of base.hqCands1 || []) { if (f1.length >= 4) break; if (f1.every((q) => far(q, c))) f1.push(c); }
-    const f2 = [null].concat(layers > 1 ? (base.earlyCands || []).slice(0, 2) : []);
-    const clash = (a, b) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1])) < 15;   // HQ squares overlap
-    const options = [];
-    for (const a of f1) for (const b of f2) {
-      if (a === f1[0] && !b) continue;   // the base run
-      if (b && clash(a, b)) continue;
-      if (options.length + 1 >= maxRuns) break;
-      const hqs = { 1: { x: a[0], y: a[1], early: true } };
-      if (b) hqs[2] = { x: b[0], y: b[1] };   // reserved; built after fence 1's anchors
-      options.push({ hqs, label: "fence 1 HQ " + a.join(",") + (b ? ", fence 2 HQ " + b.join(",") + " across fence 1's band" : "") });
-    }
-    const plans = yield options.map((o) => Object.assign({}, opts, { hqs: o.hqs }));
-    plans.forEach((p, i) => { if (p) tried.push({ plan: p, label: options[i].label }); });
-    tried.sort((p, q) => worse(p.plan, q.plan));
+    const n = Math.max(1, opts.layouts || 16);
+    prog("layouts", 0);
+    const plans = yield Array.from({ length: n }, (_, i) => Object.assign({}, opts, { noise: i || undefined }));
+    const tried = plans.map((p, i) => (p ? { plan: p, seed: i } : null)).filter(Boolean).sort((a, b) => worse(a.plan, b.plan));
+    if (!tried.length) throw new Error("Every anchor layout failed (see the log).");
     let best = tried[0].plan;
-    if (opts.prune !== false && !best.errors.length) {
-      const before = total(best);
-      const pr = yield* pruneSteps(world, input, opts, highs, best, score, onProgress);
-      if (pr.plan !== best) {
-        pr.plan.notes = pr.plan.notes.filter((n) => !/HQ placement/.test(n));
-        best = pr.plan;
+    const layoutNote = n + " anchor layout(s) designed end to end: " + tried.map((t) => total(t.plan) + (t.plan.errors.length ? "E" : "")).sort((a, b) => parseInt(a, 10) - parseInt(b, 10)).join(", ") + " banners" + (plans.length - tried.length ? " (" + (plans.length - tried.length) + " failed)" : "") + ".";
+    const pruneNotes = [];
+    if (opts.prune !== false) {
+      for (const t of tried.slice(0, 2)) {
+        if (t.plan.errors.length) continue;
+        const before = total(t.plan);
+        const pr = yield* pruneSteps(world, input, opts, highs, t.plan, score, onProgress);
+        pruneNotes.push("from " + before + ": " + pr.runs + " removal(s) tried, " + pr.kept + " kept (" + total(pr.plan) + ")");
+        if (worse(pr.plan, best) < 0) best = pr.plan;
       }
-      best.notes.unshift("Prune pass: " + pr.runs + " anchor move(s) tried (removals and 1-tile shifts), " + pr.kept + " kept (" + before + " → " + total(best) + " banners).");
     }
-    best.notes.unshift(tried.length + " HQ placement(s) designed end to end; kept " + tried[0].label + " (" + total(best) + " banners; the others " + tried.slice(1).map((t) => total(t.plan) + (t.plan.errors.length ? " with errors" : "")).join(", ") + ").");
+    if (pruneNotes.length) best.notes.unshift("Iterations (anchor removals) " + pruneNotes.join("; ") + ".");
+    best.notes.unshift(layoutNote + " Kept: " + total(best) + " banners.");
     prog("done", 1);
     return best;
   }
@@ -1237,22 +1390,21 @@
     return r.value;
   }
 
-  /* Iterations after the search. Moves: take an anchor out, then (once no removal saves anything)
-     shift one a tile (any of 8 directions; screened by the anchors alone, so a shift onto a spot
-     no anchor can hold costs nothing). Each move is designed again end to end with the fences up
+  /* Iterations after the anchor layouts. Moves: take an anchor out (1-tile shifts were dropped: they
+     never saved a banner in the tests). Each move is designed again end to end with the fences up
      to the moved anchor's fixed (connectors added only where a link breaks) and the later ones
      designed afresh, the fillers without their fine tie-breaks (same counts, about 3 times
      faster); its gain is kept per move. Each round prices every move not yet priced (one batch:
      they are independent) and takes the one that saves most; moves far from it keep their gain
      (priced again before they are taken), those near it or in later fences are priced again. The
-     final plan is designed once in full. Counts of runs, not a clock, bound the work (60 at most,
+     final plan is designed once in full. Counts of runs, not a clock, bound the work (40 at most,
      and it stops after 15 in a row that saved nothing), so every machine gives the same plan. A generator: it yields batches of runs (see designSteps). */
   function* pruneSteps(world, input, opts, highs, best, score, onProgress) {
-    const maxEvals = opts.pruneEvals || 60, maxIdle = opts.pruneIdle || 15, maxTiles = opts.pruneTiles || 12, D = 16;
+    const maxEvals = opts.pruneEvals || 40, maxIdle = opts.pruneIdle || 15, maxTiles = opts.pruneTiles || 12, D = 16;
     let lastGain = 0;   // stop after maxIdle runs in a row that saved nothing
     const n = best.fences.length;
     const key = (a) => a[0] + "," + a[1];
-    const fixOf = (fences, k) => { const o = {}; for (const f of fences) if (f.k <= k) o[f.k] = { hq: f.hq, anchors: f.anchors }; return o; };
+    const fixOf = (fences, k) => { const o = {}; for (const f of fences) if (f.k <= k) o[f.k] = { hq: f.hq, anchors: f.anchorsBuilt || f.anchors }; return o; };
     const quick = Object.assign({}, opts, { noTies: true });
     const job = (fences, k, o) => Object.assign({}, o, { hqs: best.hqsGiven || undefined, fixLayer: fixOf(fences, k) });
     let evals = 0, kept = 0, ver = 0;
@@ -1262,38 +1414,22 @@
     let P = (yield [job(best.fences, n, quick)])[0]; evals++;
     if (!P || P.errors.length) return { plan: best, runs: evals, kept };
     const snap = (plan) => { const probe = {}; simulate(world, input, plan, probe); const out = []; for (let y = plan.oy; y < plan.oy + plan.H; y++) for (let x = plan.ox; x < plan.ox + plan.W; x++) out.push(probe.tagAt(x, y)); return out; };
-    const withAnchors = (k, anchors) => P.fences.map((f) => (f.k === k ? Object.assign({}, f, { anchors }) : f));
-    const screened = new Map();   // shift id @ plan version -> the anchors alone hold it
-    let shifts = false;           // removals first; shifts once no removal saves anything
+    const withAnchors = (k, anchors, gone) => P.fences.map((f) => (f.k === k ? Object.assign({}, f, { anchors, anchorsBuilt: (f.anchorsBuilt || f.anchors).filter((b) => key(b) !== gone) }) : f));
     const movesOf = () => {
-      const taken = new Set();
-      for (const f of P.fences) { for (const a of f.anchors) taken.add(key(a)); for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) taken.add((f.hq[0] + i) + "," + (f.hq[1] + j)); }
       const base = snap(P), out = [];
       for (const f of P.fences) for (const a of f.anchors) {
         // a removal that changes much of the final ground would break the fence: not tried
         const rest = f.anchors.filter((b) => key(b) !== key(a));
-        const sn = snap(Object.assign({}, P, { fences: withAnchors(f.k, rest) }));
+        const sn = snap(Object.assign({}, P, { fences: withAnchors(f.k, rest, key(a)) }));
         let diff = 0;
         for (let i = 0; i < sn.length; i++) if (sn[i] !== base[i]) diff++;
-        if (diff <= maxTiles) out.push({ id: f.k + ":" + key(a) + ">-", k: f.k, at: a, anchors: rest, rank: diff });
-        if (shifts) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          const b = [a[0] + dx, a[1] + dy];
-          if ((!dx && !dy) || taken.has(key(b))) continue;
-          const m = { id: f.k + ":" + key(a) + ">" + key(b), k: f.k, at: a, to: b, anchors: f.anchors.map((c) => (key(c) === key(a) ? b : c)), rank: 100 };
-          const sk = m.id + "@" + ver;
-          if (!screened.has(sk)) {
-            let ok = false;
-            try { const r = designOnce(world, input, Object.assign(job(withAnchors(f.k, m.anchors), f.k, quick), { anchorsOnly: f.k }), highs, null); ok = !r.unlinked && r.anchors.some((c) => key(c) === key(b)); } catch (e) { ok = false; }
-            screened.set(sk, ok);
-          }
-          if (screened.get(sk)) out.push(m);
-        }
+        if (diff <= maxTiles) out.push({ id: f.k + ":" + key(a) + ">-", k: f.k, at: a, anchors: rest, gone: key(a), rank: diff });
       }
       return out.sort((u, v) => u.rank - v.rank);
     };
     const cache = new Map();   // move id -> { gain, ver, plan }
     const price = function* (ms) {
-      const qs = yield ms.map((m) => job(withAnchors(m.k, m.anchors), m.k, quick));
+      const qs = yield ms.map((m) => job(withAnchors(m.k, m.anchors, m.gone), m.k, quick));
       ms.forEach((m, i) => {
         evals++;
         const q = qs[i];
@@ -1317,7 +1453,7 @@
         if (cache.get(bm.id).ver !== ver) { if (budget() <= 0) { cache.delete(bm.id); continue; } yield* price([bm]); continue; }
         taken = bm; break;
       }
-      if (!taken) { if (shifts || budget() <= 0) break; shifts = true; continue; }
+      if (!taken) break;
       P = cache.get(taken.id).plan; ver++; kept++; lastGain = evals;
       const near = (a) => Math.max(Math.abs(a[0] - taken.at[0]), Math.abs(a[1] - taken.at[1])) <= D;
       for (const [id] of cache) { const m = moves.find((u) => u.id === id); if (!m || m.k > taken.k || near(m.at)) cache.delete(id); }
@@ -1341,36 +1477,74 @@
     const dropped = [];
     const early = earlyCands(g);
     let hqCands1 = [], hive = { built: [] };
-    // given HQs (game coords). Fence 1's goes up first and claims open ground now. A later fence's
-    // HQ is always built after fence 1's anchors (at its own turn): its square is only reserved, so
-    // fence 1 need not plug it, and no fence 1 square may cover its 3x3 (it must stay open ground)
+    // Fence 1's HQ goes up first and claims open ground now: the given one, or the spot whose square
+    // overlaps most of the hive HQ's (the least new ground). Each later fence's HQ goes up at its own
+    // turn, after the anchors before it (placeHQ, below).
     g.fixedHQ = {};
     g.reserved = new Uint8Array(g.N); g.resFoot = new Uint8Array(g.N);
-    for (const [k, h] of Object.entries(opts.hqs || {})) {
-      if (+k > layers) continue;
-      const x = h.x - g.ox, y = h.y - g.oy, r = sqH(x, y);
-      for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) { const t = (y + j) * g.W + x + i; if (x + i < 0 || y + j < 0 || x + i >= g.W || y + j >= g.H || g.own[t] !== U || g.hqBlock[t] || g.occ[t]) throw new Error("Fence " + k + ": no HQ can stand at " + h.x + "," + h.y + "."); }
-      g.fixedHQ[k] = { x, y, r, early: +k === 1 };
-      if (+k > 1) {
-        for (let yy = Math.max(0, r[1]); yy <= Math.min(g.H - 1, r[3]); yy++) for (let xx = Math.max(0, r[0]); xx <= Math.min(g.W - 1, r[2]); xx++) g.reserved[yy * g.W + xx] = 1;
-        for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) { const t = (y + j) * g.W + x + i; g.resFoot[t] = 1; g.occ[t] = 1; }
-        continue;
-      }
-      {
-        for (let yy = Math.max(0, r[1]); yy <= Math.min(g.H - 1, r[3]); yy++) for (let xx = Math.max(0, r[0]); xx <= Math.min(g.W - 1, r[2]); xx++) { const t = yy * g.W + xx; if (g.own[t] === U) g.own[t] = F0 + +k; }
-        for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) g.occ[(y + j) * g.W + x + i] = 1;
-      }
+    let hq1 = opts.hqs && opts.hqs[1] ? [opts.hqs[1].x - g.ox, opts.hqs[1].y - g.oy] : null;
+    if (!hq1 && !(opts.fixLayer && opts.fixLayer[1])) { const c = hqCandidates(g, 1, [])[0]; if (c) hq1 = [c.x, c.y]; }
+    if (hq1) {
+      const [x, y] = hq1, r = sqH(x, y);
+      for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) { const t = (y + j) * g.W + x + i; if (x + i < 0 || y + j < 0 || x + i >= g.W || y + j >= g.H || g.own[t] !== U || g.hqBlock[t] || g.occ[t]) throw new Error("Fence 1: no HQ can stand at " + (x + g.ox) + "," + (y + g.oy) + "."); }
+      g.fixedHQ[1] = { x, y, r, early: true };
+      for (let yy = Math.max(0, r[1]); yy <= Math.min(g.H - 1, r[3]); yy++) for (let xx = Math.max(0, r[0]); xx <= Math.min(g.W - 1, r[2]); xx++) { const t = yy * g.W + xx; if (g.own[t] === U) g.own[t] = F0 + 1; }
+      for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) g.occ[(y + j) * g.W + x + i] = 1;
     }
+    g.later = [];
     for (let k = 1; k <= layers; k++) {
       prog("anchors " + k, (k - 1) / (layers + 1));
-      const res = solveLayer(g, k, highs, opts, opts.log);
+      // fence k's HQ (k > 1): the given spot, or the first that passes, by overlap with the HQ
+      // squares already up; the banners in its way come down and the hive cycles what it must
+      let placed = null;
+      if (k > 1 && g.reg) {
+        const fixL = opts.fixLayer && opts.fixLayer[k];
+        const given = fixL ? fixL.hq : opts.hqs && opts.hqs[k] ? [opts.hqs[k].x, opts.hqs[k].y] : null;
+        let at = null, why = null;
+        if (given) {
+          at = [given[0] - g.ox, given[1] - g.oy];
+          placed = placeHQ(g, k, fences, at[0], at[1]);
+          if (!placed.ok) throw new Error("Fence " + k + ": no HQ at " + given.join(",") + " (" + placed.why + ").");
+        } else {
+          for (const c of hqCandidates(g, k, fences)) { placed = placeHQ(g, k, fences, c.x, c.y); if (placed.ok) { at = [c.x, c.y]; placed.ov = c.ov; break; } if (!why) why = placed.why; }
+        }
+        if (placed && placed.ok) {
+          g.fixedHQ[k] = { x: at[0], y: at[1], r: sqH(at[0], at[1]), placed: true };
+          dropped.push(...placed.dropped);
+          if (placed.removed.length) notes.push("Fence " + k + "'s HQ takes down " + placed.removed.length + " banner(s) of the fence(s) before it: " + placed.removed.map((b) => "F" + b.k + " " + (b.x + g.ox) + "," + (b.y + g.oy)).join(", ") + ".");
+          if (placed.cycled.length) notes.push(input.mother.tag + " destroys and rebuilds in place, for fence " + k + "'s HQ: " + placed.cycled.map(String).join(" ") + ".");
+        } else {
+          placed = null;
+          notes.push("Fence " + k + ": no HQ spot overlapping the HQs already up passes (first reason: " + (why || "none found") + "); its HQ is chosen by its band.");
+        }
+      }
+      const s0 = k > 1 && g.reg ? snapG(g, fences) : null;
+      let res = null, c = null, cycA = null;
+      for (let attempt = 0; ; attempt++) {
+        res = solveLayer(g, k, highs, opts, opts.log);
+        if (!res) break;
+        if (k === 1) hqCands1 = res.hqCands.map(([x, y]) => [x + g.ox, y + g.oy]);
+        // the prune pass screens a move by its own fence's anchors alone
+        if (opts.anchorsOnly === k) return { k, anchors: res.anchors.map((a) => [a.x + g.ox, a.y + g.oy]), unlinked: (res.unlinked || []).length };
+        c = commitLayer(g, k, res);
+        if (!s0) break;
+        // the registry follows: the HQ (if its band chose it) and the anchors, then the hive cycles
+        // every banner whose ground an anchor square needs; a cycle that would cost the hive a
+        // building rules those anchors out and the layer is solved again
+        if (placed) res.hq.reg = placed.hqReg;
+        else { res.hq.reg = g.reg.length; g.reg.push({ code: F0 + k, r: res.hq.r, kind: "hq", alive: true }); regPaint(g, res.hq.r); }
+        for (const a of c.order) { a.reg = g.reg.length; g.reg.push({ code: F0 + k, r: a.r, kind: "anchor", alive: true }); regPaint(g, a.r); }
+        cycA = cycleHive(g, c.order.map((a) => a.r));
+        if (cycA.ok || attempt >= 3) break;
+        restoreG(g, s0, fences);
+        g.noAnchor = g.noAnchor || new Set();
+        for (const a of c.order) if (Math.max(a.r[0], cycA.bad[0]) <= Math.min(a.r[2], cycA.bad[2]) && Math.max(a.r[1], cycA.bad[1]) <= Math.min(a.r[3], cycA.bad[3])) g.noAnchor.add(a.p);
+      }
       if (!res) { notes.push("Fence " + k + ": nothing left to enclose."); break; }
-      if (k === 1) hqCands1 = res.hqCands.map(([x, y]) => [x + g.ox, y + g.oy]);
-      // the prune pass screens a move by its own fence's anchors alone
-      if (opts.anchorsOnly === k) return { k, anchors: res.anchors.map((a) => [a.x + g.ox, a.y + g.oy]), unlinked: (res.unlinked || []).length };
-      const c = commitLayer(g, k, res);
+      if (cycA && !cycA.ok) notes.push("Fence " + k + ": " + cycA.why + ".");
       if (k === 1) {
         hive = rehive(g, highs, opts);
+        g.rebuilt = hive.built;
         dropped.push(...hive.dropped);
         if (hive.missing) notes.push(input.mother.tag + ": " + hive.missing + " city/statue/node tile(s) left without territory after the rebuild.");
       }
@@ -1378,7 +1552,16 @@
       // hive can't rebuild holds it)
       res.softLeft = res.soft.filter((t) => g.own[t] === M_BAN).length;
       dropped.push(...c.dropped);
-      fences.push({ k, hq: res.hq, anchors: c.order, band: res.band, uncovered: res.uncovered, optimal: res.optimal, unlinked: res.unlinked, softLeft: res.softLeft, early: !!(g.fixedHQ[k] && g.fixedHQ[k].early) });
+      if (cycA && cycA.ok) dropped.push(...cycA.dropped);
+      fences.push({ k, hq: res.hq, anchors: c.order, order0: c.order.slice(), band: res.band, uncovered: res.uncovered, optimal: res.optimal, unlinked: res.unlinked, softLeft: res.softLeft, early: !!(g.fixedHQ[k] && g.fixedHQ[k].early),
+        removes: placed ? placed.removed : [], cycleHQ: placed ? placed.cycled : [], cycleAnchors: cycA && cycA.ok ? cycA.cycled : [] });
+      if (placed || (cycA && cycA.ok && cycA.freed.length)) {
+        const mask = new Uint8Array(g.N);
+        for (const t of placed ? placed.foot.concat(placed.freed) : []) mask[t] = 1;
+        for (const t of cycA && cycA.ok ? cycA.freed : []) mask[t] = 1;
+        g.later.push({ k, mask });
+      }
+      if (k === 1) buildReg(g, input, fences, opts.log);
     }
     prog("fillers", layers / (layers + 1));
     let fill = solveFillers(g, highs, opts, fences);
@@ -1410,6 +1593,11 @@
         k: f.k, tag: tags[f.k - 1] || "F" + f.k,
         hq: G(f.hq.x, f.hq.y),
         anchors: f.anchors.map((a) => G(a.x, a.y)),
+        // every anchor it builds, in chain order, those a later HQ takes down included
+        anchorsBuilt: (f.order0 || f.anchors).map((a) => G(a.x, a.y)),
+        // banners of earlier fences taken down for its HQ, and the hive's destroy-and-rebuild cycles
+        removes: (f.removes || []).map((b) => ({ k: b.k, x: b.x + g.ox, y: b.y + g.oy })),
+        cycleHQ: (f.cycleHQ || []).map((b) => b.slice()), cycleAnchors: (f.cycleAnchors || []).map((b) => b.slice()),
         fillers: [], buildings: [],
         uncovered: f.uncovered.map((t) => G(t % g.W, (t / g.W) | 0)), anchorsOptimal: f.optimal,
         unlinked: (f.unlinked || []).map((a) => G(a.x, a.y)), softLeft: f.softLeft || 0, early: f.early,
@@ -1433,7 +1621,7 @@
     // final territory for the map: every banner's square, fillers included (open ground goes to
     // whoever builds there first, in build order)
     for (const s of buildSteps(plan)) for (const it of s.items) {
-      if (it.type !== "banner" || it.role === "rebuild" || it.role === "anchor") continue;
+      if (it.type !== "banner" || it.role === "rebuild" || it.role === "anchor" || it.role === "destroy") continue;
       const code = it.tag === plan.hiveTag ? M_BAN : F0 + plan.fences.find((f) => f.tag === it.tag).k;
       for (let y = it.y - 3; y <= it.y + 3; y++) for (let x = it.x - 3; x <= it.x + 3; x++) { const i = g.idx(x, y); if (i >= 0 && g.own[i] === U) g.own[i] = code; }
     }
@@ -1463,67 +1651,68 @@
     return plan;
   }
 
-  /* Build order: the HQs built first; fence 1 anchors; hive rebuild; fence 1 yellows; hive fillers
-     (and its statues); fence 2 anchors;
-     fence 1 oranges; fence 2 yellows; fence 3 anchors; fence 2 oranges; ... ; last fence oranges.
-     Returns [{title, items:[{tag, type, x, y, role}]}]. */
+  /* Build order: fence 1's HQ and anchors; the hive destroys and rebuilds what fence 1 needs; then for
+     each later fence: the banners of earlier fences in the way of its HQ come down, its HQ, the hive's
+     destroy-and-rebuild cycles for that HQ, its anchors (and their cycles), then the fillers of the
+     fence before it (shut in now): yellow, buildings, orange. Last: the last fence's fillers, then the
+     hive's fillers, statues and extra cities. Returns [{title, items:[{tag, type, x, y, role}]}]. */
   function buildSteps(plan) {
     const steps = [];
     const n = plan.fences.length;
+    const hive = plan.hiveTag;
     const push = (title, items) => { if (items.length) steps.push({ title, items }); };
-    const fenceItems = (f, phase, orange) => {
-      const items = [];
-      for (const b of f.fillers) if (b.phase === phase && !!b.orange === orange && !b.pre) items.push({ tag: f.tag, type: "banner", x: b.x, y: b.y, role: b.orange ? "orange" : b.grey ? "grey" : "yellow" });
-      if (!orange) for (const b of f.buildings) if (b.phase === phase) items.push({ tag: f.tag, type: b.type, x: b.x, y: b.y, role: "building" });
-      return items;
+    const banner = (tag, x, y, role) => ({ tag, type: "banner", x, y, role });
+    const cycle = (list) => [].concat(...list.map(([x, y]) => [banner(hive, x, y, "destroy"), banner(hive, x, y, "rebuild")]));
+    const fill = (f, last) => {
+      const live = f.fillers.filter((b) => !b.pre);
+      push((last ? "Last: " : "") + f.tag + " yellow fillers" + (last ? "" : " (it is shut in now)"), live.filter((b) => !b.orange).map((b) => banner(f.tag, b.x, b.y, b.grey ? "grey" : "yellow")));
+      push(f.tag + " buildings", f.buildings.map((b) => ({ tag: f.tag, type: b.type, x: b.x, y: b.y, role: "building" })));
+      push(f.tag + " orange fillers" + (last ? " (they expand its territory)" : ""), live.filter((b) => b.orange).map((b) => banner(f.tag, b.x, b.y, "orange")));
     };
-    const hiveItems = (phase) => {
-      const items = [];
-      for (const b of plan.hive.banners) if (b.phase === phase) items.push({ tag: plan.hiveTag, type: "banner", x: b.x, y: b.y, role: b.orange ? "orange" : "yellow" });
-      for (const b of plan.hive.buildings) if (b.phase === phase) items.push({ tag: plan.hiveTag, type: b.type, x: b.x, y: b.y, role: "building" });
-      for (const c of plan.hive.cities || []) if (c.phase === phase) items.push({ tag: plan.hiveTag, type: "city", x: c.x, y: c.y, role: "city", k: c.k, secs: c.secs });
-      return items;
-    };
-    const isEarly = (f) => plan.hqsFirst || f.early;
-    const hqStep = (fs) => steps.push({ title: fs.length > 1 ? "HQs built first: " + fs.map((f) => f.tag).join(", ") : fs[0].tag + " HQ", items: fs.map((f) => ({ tag: f.tag, type: "hq", x: f.hq[0], y: f.hq[1] })) });
-    if (plan.fences.some(isEarly)) hqStep(plan.fences.filter(isEarly));
     for (let k = 1; k <= n; k++) {
       const f = plan.fences[k - 1];
-      if (!isEarly(f)) hqStep([f]);
-      steps.push({ title: f.tag + " anchors, in chain order from its HQ", items: f.anchors.map(([x, y]) => ({ tag: f.tag, type: "banner", x, y, role: "anchor" })) });
+      push("Take down the banners in the way of " + f.tag + "'s HQ", (f.removes || []).map((b) => banner(plan.fences[b.k - 1].tag, b.x, b.y, "destroy")));
+      steps.push({ title: f.tag + " HQ", items: [{ tag: f.tag, type: "hq", x: f.hq[0], y: f.hq[1] }] });
+      push(hive + ": destroy and rebuild in place, one at a time (" + f.tag + "'s HQ takes their ground)", cycle(f.cycleHQ || []));
+      push(f.tag + " anchors, in chain order from its HQ", (f.anchorsBuilt || f.anchors).map(([x, y]) => banner(f.tag, x, y, "anchor")));
       if (k === 1) {
-        push(plan.hiveTag + ": destroy these banners", (plan.destroy || []).map(([x, y]) => ({ tag: plan.hiveTag, type: "banner", x, y, role: "destroy" })));
-        push(plan.hiveTag + ": build these banners (in this order)", plan.rebuild.map(([x, y]) => ({ tag: plan.hiveTag, type: "banner", x, y, role: "rebuild" })));
+        push(hive + ": destroy these banners", (plan.destroy || []).map(([x, y]) => banner(hive, x, y, "destroy")));
+        push(hive + ": build these banners (in this order)", plan.rebuild.map(([x, y]) => banner(hive, x, y, "rebuild")));
       }
-      push(f.tag + " fillers that claim ground for the rest (orange)", f.fillers.filter((b) => b.pre).map((b) => ({ tag: f.tag, type: "banner", x: b.x, y: b.y, role: "orange" })));
-      if (k > 1) {
-        const items = [];
-        for (const fj of plan.fences.slice(0, k - 1)) items.push(...fenceItems(fj, k, true));
-        items.push(...hiveItems(k));
-        push("Orange fillers now that " + f.tag + "'s anchors stand", items);
-      }
-      push(f.tag + " yellow fillers", fenceItems(f, k, false));
-      if (k === 1) push(plan.hiveTag + " fillers", hiveItems(1));
+      push(hive + ": destroy and rebuild in place, one at a time (" + f.tag + "'s anchors take their ground)", cycle(f.cycleAnchors || []));
+      push(f.tag + " fillers that claim ground for the rest (orange)", f.fillers.filter((b) => b.pre).map((b) => banner(f.tag, b.x, b.y, "orange")));
+      if (k > 1) fill(plan.fences[k - 2], false);
     }
-    push("Last: " + plan.fences[n - 1].tag + " orange fillers (they expand its territory)", fenceItems(plan.fences[n - 1], n + 1, true));
+    if (n) fill(plan.fences[n - 1], true);
+    push("Last of all: " + hive + " fillers", plan.hive.banners.map((b) => banner(hive, b.x, b.y, b.orange ? "orange" : "yellow")));
+    push(hive + " statues and node", plan.hive.buildings.map((b) => ({ tag: hive, type: b.type, x: b.x, y: b.y, role: "building" })));
+    push(hive + " extra cities", (plan.hive.cities || []).map((c) => ({ tag: hive, type: "city", x: c.x, y: c.y, role: "city", k: c.k, secs: c.secs })));
     return steps;
   }
 
   const COLOUR = { anchor: "#ff0080", yellow: "#ffff00", grey: "#c0c0c0", orange: "#ff8040", rebuild: "#80ff80", building: "#222222", hq: "#8e44ad", trap: "#c0392b" };
 
   /* KSMapper import CSV (type,X,Y,label,#color,seq), in build order. */
-  function toCsv(plan) {
-    const rows = [];
-    let seq = 1;
+  /* The rows of buildSteps that still stand at the end, in build order: a banner taken down drops
+     out (the base rows of the map included), one rebuilt in place comes back at its new turn. */
+  function standingRows(plan, base) {
+    const rows = base.slice();
     for (const s of buildSteps(plan)) for (const it of s.items) {
-      if (it.role === "destroy") continue;
-      if (it.type === "hq") rows.push(["hq", it.x, it.y, it.tag, COLOUR.hq, seq++]);
-      else if (it.type === "banner") rows.push(["banner", it.x, it.y, it.tag, COLOUR[it.role], seq++]);
-      else if (it.type === "trap") rows.push(["beartrap", it.x, it.y, it.tag, COLOUR.trap, seq++]);
-      else if (it.type === "city") rows.push(["city", it.x, it.y, "BT" + (it.k + 1) + " extra " + it.secs + "s", it.k === 0 ? "#85c1e9" : "#f5cba7", seq++]);
-      else rows.push([it.type === "node" ? "obs3" : "obs2", it.x, it.y, it.tag + (it.type === "node" ? " node" : " statue"), COLOUR.building, seq++]);
+      if (it.role === "destroy") {
+        for (let i = rows.length - 1; i >= 0; i--) { const r = rows[i]; if (r[0] === "banner" && r[1] === it.x && r[2] === it.y && r[3] === it.tag) { rows.splice(i, 1); break; } }
+        continue;
+      }
+      if (it.type === "hq") rows.push(["hq", it.x, it.y, it.tag, COLOUR.hq]);
+      else if (it.type === "banner") rows.push(["banner", it.x, it.y, it.tag, COLOUR[it.role]]);
+      else if (it.type === "trap") rows.push(["beartrap", it.x, it.y, it.tag, COLOUR.trap]);
+      else if (it.type === "city") rows.push(["city", it.x, it.y, "BT" + (it.k + 1) + " extra " + it.secs + "s", it.k === 0 ? "#85c1e9" : "#f5cba7"]);
+      else rows.push([it.type === "node" ? "obs3" : "obs2", it.x, it.y, it.tag + (it.type === "node" ? " node" : " statue"), COLOUR.building]);
     }
-    return rows.map((r) => r.join(",")).join("\n") + "\n";
+    return rows;
+  }
+
+  function toCsv(plan) {
+    return standingRows(plan, []).map((r, i) => r.concat(i + 1).join(",")).join("\n") + "\n";
   }
 
   /* The whole map in one KSMapper CSV, one seq in build order (KSMapper gives each tile to the
@@ -1551,15 +1740,7 @@
       base.push({ row, key: Number.isFinite(sq) ? sq : Infinity, i });
     });
     base.sort((p, q) => p.key - q.key || p.i - q.i);
-    const rows = base.map((b) => b.row);
-    for (const s of buildSteps(plan)) for (const it of s.items) {
-      if (it.role === "destroy") continue;
-      if (it.type === "hq") rows.push(["hq", it.x, it.y, it.tag, COLOUR.hq]);
-      else if (it.type === "banner") rows.push(["banner", it.x, it.y, it.tag, COLOUR[it.role]]);
-      else if (it.type === "trap") rows.push(["beartrap", it.x, it.y, it.tag, COLOUR.trap]);
-      else if (it.type === "city") rows.push(["city", it.x, it.y, "BT" + (it.k + 1) + " extra " + it.secs + "s", it.k === 0 ? "#85c1e9" : "#f5cba7"]);
-      else rows.push([it.type === "node" ? "obs3" : "obs2", it.x, it.y, it.tag + (it.type === "node" ? " node" : " statue"), COLOUR.building]);
-    }
+    const rows = standingRows(plan, base.map((b) => b.row));
     return rows.map((r, i) => r.concat(i + 1).join(",")).join("\n") + "\n";
   }
 
@@ -1661,7 +1842,7 @@
     for (const { what, s, k } of ruled) {
       if (k < 2 || !s.alive) continue;
       let n = 0;
-      for (let y = s.r[1]; y <= s.r[3]; y++) for (let x = s.r[0]; x <= s.r[2]; x++) if (tagOf(idx(x, y)) === hive) n++;
+      for (let y = s.r[1]; y <= s.r[3]; y++) for (let x = s.r[0]; x <= s.r[2]; x++) { const t = idx(x, y); if (tagOf(t) === hive && ownIdx[t] !== 0) n++; }
       if (n) errs.push(s.tag + " " + what + " " + s.x + "," + s.y + " square holds " + n + " tile(s) of hive ground");
     }
     // closure: the hive's and the inner fences' territory must not touch open ground that reaches
@@ -1681,33 +1862,10 @@
       if (!leaks.has(key)) leaks.set(key, (t % W + g.ox) + "," + (((t / W) | 0) + g.oy));
     }
     for (const [key, at] of leaks) errs.push("Fence open: " + key + " territory touches open ground outside at " + at);
-    // every ring whole: the hive's territory touches only fence 1's, fence k's only fence k-1's and
-    // k+1's (fence 2 touching the hive means fence 1 has a gap there)
+    // layers (the hive 0, fence k) for the checks below; any layers may meet (no ring rule): only
+    // closure and free 2x2s count
     const layer = new Map([[hive, 0]].concat(plan.fences.map((f) => [f.tag, f.k])));
     const netAt = (t) => ownIdx[t] >= 0 && structs[ownIdx[t]].network;
-    const gaps = new Map();
-    for (let t = 0; t < N; t++) {
-      const a = layer.get(tagOf(t));
-      if (a === undefined || netAt(t)) continue;
-      for (const s of nb4(t)) {
-        if (s < 0 || netAt(s)) continue;
-        const b = layer.get(tagOf(s));
-        if (b === undefined || b < a + 2) continue;
-        const key = tagOf(t) + " touches " + tagOf(s);
-        if (!gaps.has(key)) gaps.set(key, (s % W + g.ox) + "," + (((s / W) | 0) + g.oy));
-      }
-    }
-    // a line of open ground between two layers that should not meet is a gap too
-    for (let t = 0; t < N; t++) {
-      if (tagOf(t) !== null || outside[t]) continue;
-      const ls = nb4(t).filter((s) => s >= 0 && !netAt(s)).map((s) => tagOf(s)).filter((o) => layer.has(o));
-      if (!ls.length) continue;
-      const lo = ls.reduce((a, o) => (layer.get(o) < layer.get(a) ? o : a)), hi = ls.reduce((a, o) => (layer.get(o) > layer.get(a) ? o : a));
-      if (layer.get(hi) - layer.get(lo) < 2) continue;
-      const key = lo + " touches " + hi + " across open ground";
-      if (!gaps.has(key)) gaps.set(key, (t % W + g.ox) + "," + (((t / W) | 0) + g.oy));
-    }
-    for (const [key, at] of gaps) errs.push("Ring broken: " + key + " at " + at);
     // no free 2x2 shut in: every 2x2 of open, buildable, unoccupied tiles is plugged, but those
     // wholly the last fence's (its ground beyond the ring) or open to the outside
     const last = plan.fences.length ? plan.fences[plan.fences.length - 1].tag : hive;
@@ -1755,12 +1913,16 @@
     mark(sqH(...input.mother.hq));
     for (const b of g.split.hive) if (!destroyed.has(String(b))) mark(sqB(...b));
     const destroyedTile = new Set(g.split.hive.filter((b) => destroyed.has(String(b))).map((b) => idx(b[0], b[1])));
+    // ground a destroyed hive banner frees goes first to other alliances' squares that cover it
+    const otherCover = new Uint8Array(g.N);
+    for (const r of input.others.hqs.map((h) => sqH(...h)).concat(input.others.banners.concat(g.split.network).map((b) => sqB(...b)))) for (let y = r[1]; y <= r[3]; y++) for (let x = r[0]; x <= r[2]; x++) { const t = idx(x, y); if (t >= 0) otherCover[t] = 1; }
     const square = (tag, what, r, k, eat) => {
       for (let y = r[1]; y <= r[3]; y++) for (let x = r[0]; x <= r[2]; x++) {
         const t = idx(x, y);
         if (t < 0) continue;
         const takes = own[t] === U || (eat && own[t] === M_BAN && !keep[t]);
         if (!takes) continue;
+        if (own[t] === M_BAN && otherCover[t]) { own[t] = OTHER; continue; }
         if (g.prot[t] && !destroyedTile.has(t)) errs.push(tag + " " + what + " square takes the hive's " + x + "," + y);
         if (g.extraAt[t] >= 0) {
           const c = input.mother.cities[g.extraAt[t]];
@@ -1799,11 +1961,23 @@
         square(f.tag, "anchor " + x + "," + y, r, k, k === 1);
         if (k === 1) gain(r, F0 + 1);
       }
+      if (k > 1 && ((f.cycleHQ || []).length || (f.cycleAnchors || []).length)) {
+        // the hive destroyed and rebuilt these banners in place: their ground in this fence's HQ and
+        // anchor squares that no other hive banner (nor the hive HQ) covers is now the fence's
+        const cyc = new Set((f.cycleHQ || []).concat(f.cycleAnchors || []).map(String));
+        const standing = g.split.hive.filter((b) => !destroyed.has(String(b))).concat(plan.rebuild || []).filter((b) => !cyc.has(String(b))).map((b) => sqB(...b));
+        const hiveR = sqH(...input.mother.hq);
+        for (const r of [sqH(...f.hq)].concat(f.anchors.map((a) => sqB(...a)))) for (let y = r[1]; y <= r[3]; y++) for (let x = r[0]; x <= r[2]; x++) {
+          const t = idx(x, y);
+          if (t < 0 || own[t] !== M_BAN || inR(hiveR, x, y) || standing.some((q) => inR(q, x, y))) continue;
+          own[t] = F0 + k;
+        }
+      }
       if (k !== 1) continue;
       // the hive destroys those banners (their land nothing else of the hive covers is open
       // ground) and builds the new ones, each touching (corners count) its territory
       for (const b of g.split.hive) if (destroyed.has(String(b))) { const t = idx(b[0], b[1]); if (t >= 0) g.occ[t] = 0; }
-      for (let t = 0; t < g.N; t++) if (own[t] === M_BAN && !keep[t]) own[t] = U;
+      for (let t = 0; t < g.N; t++) if (own[t] === M_BAN && !keep[t]) own[t] = otherCover[t] ? OTHER : U;
       for (const [x, y] of plan.rebuild || []) {
         const t = idx(x, y);
         if (t < 0 || !(own[t] === U || own[t] === M_HQ || own[t] === M_BAN)) errs.push(plan.hiveTag + " new banner " + x + "," + y + " on another alliance's ground");

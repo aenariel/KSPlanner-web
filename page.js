@@ -335,7 +335,7 @@ $("frun").onclick = () => {
     const m = e.data;
     if (m.type === "progress") {
       const st = m.p.stage;
-      $("frunmsg").textContent = st.startsWith("anchors") ? "Placing the HQ and anchors of fence " + st.split(" ")[1] + "…" : st === "fillers" ? "Plugging every free 2x2 space…" : st === "prune" ? "Trying anchor removals and shifts end to end (this takes minutes)…" : st === "hq search" ? "Designing several HQ placements end to end…" : "Finishing…";
+      $("frunmsg").textContent = st.startsWith("anchors") ? "Placing the HQ and anchors of fence " + st.split(" ")[1] + "…" : st === "fillers" ? "Plugging every free 2x2 space…" : st === "prune" ? "Trying anchor removals end to end (this takes minutes)…" : st === "layouts" ? "Designing 16 anchor layouts end to end…" : "Finishing…";
       $("fprog").style.width = Math.round((m.p.frac || 0) * 100) + "%";
     } else if (m.type === "fence-done") {
       fenceReady(); $("fprog").style.width = "100%";
