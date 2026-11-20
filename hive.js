@@ -615,6 +615,8 @@
     return out;
   }
   const mirrorPattern = (P) => P.map(([x, y]) => [1 - x, y]);
+  // a slot whose mirror image is in the other cluster: worth this many tiles of distance in a refit
+  const SYM_BONUS = 0.3;
 
   // ---------------------------------------------------------------- banners: set cover of the core
   /* Required tiles: every core city tile outside the HQ square. Candidates: free, alliance-buildable
@@ -650,16 +652,22 @@
   }
 
   /* Minimum number of banners; among equal counts, the ones closest to the traps (weight = tie-break,
-     kept far below 1 per banner so it never trades a banner for compactness). */
-  function exactCover(highs, req, cand, timeLimit, weight) {
+     kept far below 1 per banner so it never trades a banner for compactness). mirror (optional):
+     banner tile -> its mirror image's tile; a banner whose image also stands earns 0.1 (0.2 a pair),
+     still far below a banner, so symmetry never costs a banner but wins over compactness. */
+  function exactCover(highs, req, cand, timeLimit, weight, mirror) {
     const ids = [...cand.keys()];
     const byReq = req.map(() => []);
     ids.forEach((b, j) => { for (const ri of cand.get(b)) byReq[ri].push(j); });
     if (byReq.some((a) => !a.length)) return null;
     const coef = (b) => (weight ? (1 + Math.min(weight(b), 30) / 1000).toFixed(6) + " " : "");
-    const L = ["Minimize", " obj: " + ids.map((b, j) => coef(b) + "y" + j).join(" + "), "Subject To"];
+    const jOf = new Map(ids.map((b, j) => [b, j]));
+    const pairs = [];
+    if (mirror) ids.forEach((b, j) => { const m = jOf.get(mirror(b)); if (m !== undefined) pairs.push([j, m]); });
+    const L = ["Minimize", " obj: " + ids.map((b, j) => coef(b) + "y" + j).join(" + ") + pairs.map((_, q) => " - 0.1 z" + q).join(""), "Subject To"];
     byReq.forEach((a, ri) => L.push(" r" + ri + ": " + a.map((j) => "y" + j).join(" + ") + " >= 1"));
-    L.push("Binary", " " + ids.map((b, j) => "y" + j).join(" "), "End");
+    pairs.forEach(([j, m], q) => { L.push(" za" + q + ": z" + q + " - y" + j + " <= 0"); if (m !== j) L.push(" zb" + q + ": z" + q + " - y" + m + " <= 0"); });
+    L.push("Binary", " " + ids.map((b, j) => "y" + j).join(" ") + pairs.map((_, q) => " z" + q).join(""), "End");
     const sol = solveLP(highs, L.join("\n"), timeLimit);
     if (!sol || !sol.Columns) return null;
     const out = [];
@@ -896,8 +904,10 @@
 
   /* Trap cluster rebuilt on the spot around ground obstacles (fixed HQ only): row 1 is the fixed
      pinwheel, row 2 is kept whole where it can be (heavy penalty per missing slot), rows 3-4 adapt.
-     pat: the ideal pattern in the wanted orientation (anchors relative to the trap anchor). */
-  function rowCluster(ctx, highs, tx, ty, pat, N, K, timeLimit, nodeLimit) {
+     pat: the ideal pattern in the wanted orientation (anchors relative to the trap anchor).
+     prefer (optional): set of slot anchors (context indices) worth a small bonus, e.g. the mirror
+     of the other trap's slots, so the refit stays as symmetric as the obstacles allow. */
+  function rowCluster(ctx, highs, tx, ty, pat, N, K, timeLimit, nodeLimit, prefer) {
     const { S, ally, city } = ctx;
     const R = ctx.R;
     const key = (x, y) => y * S + x;
@@ -932,7 +942,7 @@
         bIdx.set(kk, bIdx.size);
       }
     }
-    const obj = cands.map((v, i) => (dC(v.c) - (v.r2 ? 40 : 0)).toFixed(5) + " x" + i).join(" + ").replace(/\+ -/g, "- ");
+    const obj = cands.map((v, i) => (dC(v.c) - (v.r2 ? 40 : 0) - (prefer && prefer.has(key(...v.c)) ? SYM_BONUS : 0)).toFixed(5) + " x" + i).join(" + ").replace(/\+ -/g, "- ");
     const L = ["Minimize", " obj: " + obj, "Subject To", " n: " + cands.map((v, i) => "x" + i).join(" + ") + " = " + N,
       " k: " + (bIdx.size ? [...bIdx.values()].map((j) => "b" + j).join(" + ") : "0 x0") + " <= " + K];
     cands.forEach((v, i) => { if (v.fixed) L.push(" f" + i + ": x" + i + " = 1"); });
@@ -963,7 +973,7 @@
      for K banners around the HQ square) is rotated to each side of the HQ; clean pairs are kept,
      the best per banner budget go to an exact banner cover. Results sorted by average distance. */
   async function solve(world, cx, cy, opts, onProgress, highs) {
-    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 30, bannerCost: 0.1, centreTie: 0.2 }, opts || {});
+    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 30, bannerCost: 0.1, centreTie: 0.2, symCost: 1 }, opts || {});
     // nearer the map's centre is better (Fertile Land gives cities a big bonus), but only as a
     // tie-break: the traps' mean distance to it (Chebyshev, like the zones)
     const centreDist = (traps) => traps.reduce((a, t) => a + Math.max(Math.abs(t[0] + 1.5 - 600), Math.abs(t[1] + 1.5 - 600)), 0) / traps.length;
@@ -982,7 +992,10 @@
     if (!highs) throw new Error("The exact solver (HiGHS) is required.");
     const lib = (opts.library || []).filter((m) => m.cities.length === m.N);
     if (!lib.length) throw new Error("No cluster library loaded.");
+    // minCities is the number of cities wanted in all: the two clusters hold up to the library's
+    // largest pair, extra slots in the free territory make up the rest
     const minC = opts.minCities;
+    const coreMin = Math.min(minC, 2 * Math.max(...lib.map((m) => m.N)));
     const tick = () => new Promise((r) => setTimeout(r, 0));
     const P = idealPattern(highs, 60);   // row definitions (first 8, next 16, ...) and the base pinwheel
     const ideal = P.slice(0, 48).reduce((a, [x, y]) => a + Math.hypot(x - 0.5, y - 0.5), 0) / 48;
@@ -1000,6 +1013,18 @@
         variants.push({ m, pat, off, rot: r, inner });
       }
     }
+    // mirror images in the HQ's axes, relative to the trap anchor: "x" flips x about the HQ's middle
+    // column, "y" flips y about its middle row
+    const mirPat = (axis, pat) => pat.map(axis === "x" ? ([x, y]) => [1 - x, y] : ([x, y]) => [x, 1 - y]);
+    const mirOff = (axis, off) => (axis === "x" ? [-off[0], off[1]] : [off[0], -off[1]]);
+    const mirV = (v, axis) => ({ m: v.m, pat: mirPat(axis, v.pat), off: mirOff(axis, v.off), rot: v.rot, inner: v.inner, mir: axis, base: v });
+    // the ideal pattern (rows 1-2 fixed in a refit) in a variant's orientation
+    const idealOf = (v) => {
+      if (v.base) return mirPat(v.mir, idealOf(v.base));
+      let pat = v.m.chir ? mirrorPattern(P) : P;
+      for (let r = 0; r < v.rot; r++) pat = pat.map(rotA);
+      return pat;
+    };
     const RAD = 40;
     function contextFor(hx, hy) {
       const ctx = makeContext(world, hx, hy, { radius: RAD });
@@ -1029,13 +1054,24 @@
         for (const part of parts) for (const i of part.cityA) for (const j of [i, i + 1, i + S, i + S + 1]) if (!inHqSq(j)) req.push(j);
         return { occ, req, cover: coverProblem(ctx, occ, req) };
       };
-      return { ctx, place, problem };
+      // mirror images in the HQ's axes (context coordinates): a placed cluster, its slots as a
+      // preference set for a refit, a banner tile
+      const mx = (axis, x, y, w) => (axis === "x" ? [2 * R + 3 - x - w, y] : [x, 2 * R + 3 - y - w]);
+      const mirror = {
+        part: (p, axis) => {
+          const [tx, ty] = mx(axis, p.tx, p.ty, 3);
+          return place(tx, ty, mirPat(axis, p.cityA.map((i) => [i % S - p.tx, ((i / S) | 0) - p.ty])));
+        },
+        pref: (p, axis) => new Set(p.cityA.map((i) => { const [x, y] = mx(axis, i % S, (i / S) | 0, 2); return y * S + x; })),
+        banner: (axis) => (b) => { const [x, y] = mx(axis, b % S, (b / S) | 0, 1); return y * S + x; },
+      };
+      return { ctx, place, problem, mirror };
     }
 
     // 1. pair compatibility (clusters must not overlap) depends only on the variants: precompute once
     //    in HQ-relative coordinates; per HQ position only ground and map edges change.
     const G = 70, GO = 35;   // grid around the HQ anchor
-    const vt = variants.map((v) => {
+    const tilesOf = (v) => {
       const tx = -v.off[0], ty = -v.off[1];
       const t = [];
       let x0 = tx, y0 = ty, x1 = tx + 2, y1 = ty + 2;
@@ -1047,12 +1083,13 @@
       }
       v.box = [x0, y0, x1, y1];
       return t;
-    });
+    };
+    const vt = variants.map(tilesOf);
     // keep, per trap position and budget, only the most compact variant
     const bestVar = new Map();
     variants.forEach((v, i) => { const k = v.off.join(",") + "|" + v.m.K + "|" + v.m.N; const j = bestVar.get(k); if (j === undefined || v.m.avg < variants[j].m.avg) bestVar.set(k, i); });
     const vids = [...bestVar.values()];
-    const compat = [];
+    const compat = [], mids = [], mcompat = [];
     {
       const stamp = new Int32Array(G * G);
       let st = 0;
@@ -1063,12 +1100,27 @@
         for (let b = a + 1; b < vids.length; b++) {
           const j = vids[b];
           if (variants[i].off[0] === variants[j].off[0] && variants[i].off[1] === variants[j].off[1]) continue;
-          if (variants[i].m.N + variants[j].m.N < minC) continue;
+          if (variants[i].m.N + variants[j].m.N < coreMin) continue;
           const bi = variants[i].box, bj = variants[j].box;
           let clash = false;
           if (!(bi[2] < bj[0] || bj[2] < bi[0] || bi[3] < bj[1] || bj[3] < bi[1])) for (const t of vt[j]) if (stamp[t] === st) { clash = true; break; }
           if (!clash) compat.push([i, j]);
         }
+      }
+      // symmetric pairs: each kept variant with its own mirror image on the other side of the HQ
+      for (const i of vids) for (const axis of ["x", "y"]) {
+        const v = variants[i], w = mirV(v, axis);
+        if (w.off[0] === v.off[0] && w.off[1] === v.off[1]) continue;
+        if (2 * v.m.N < coreMin) continue;
+        const j = variants.length;
+        variants.push(w);
+        vt.push(tilesOf(w));
+        st++;
+        for (const t of vt[i]) stamp[t] = st;
+        const bi = v.box, bj = w.box;
+        let clash = false;
+        if (!(bi[2] < bj[0] || bj[2] < bi[0] || bi[3] < bj[1] || bj[3] < bi[1])) for (const t of vt[j]) if (stamp[t] === st) { clash = true; break; }
+        if (!clash) { mids.push(j); mcompat.push([i, j, axis]); }
       }
     }
 
@@ -1105,7 +1157,7 @@
       const [hx, hy] = positions[q];
       const ctx = makeContext(world, hx, hy, { radius: RAD });
       const R = ctx.R, S = ctx.S;
-      for (const i of vids) {
+      for (const i of vids.concat(mids)) {
         const v = variants[i];
         const tx = R - v.off[0], ty = R - v.off[1];
         let ok = tx >= 4 && ty >= 4 && tx + 6 < S && ty + 6 < S, hits = 0;
@@ -1120,14 +1172,16 @@
         }
         valid[i] = ok ? hits + 1 : 0;
       }
-      for (const [i, j] of compat) {
+      // free pairs under their banner budget; symmetric pairs apart (budget + 1000), so they are
+      // never crowded out by slightly better estimates (the symmetry is priced at the end)
+      for (const [i, j, mir] of compat.concat(mcompat)) {
         if (!valid[i] || !valid[j]) continue;
         const A = variants[i], B = variants[j];
         if (forced.length && !forcedOK(hx, hy, A, B)) continue;
         const hA = valid[i] - 1, hB = valid[j] - 1;
         // each slot moved off an obstacle costs roughly 2 tiles of distance (estimate; re-fitted exactly later)
         const avg = (A.m.N * A.m.avg + B.m.N * B.m.avg + 2 * (hA + hB)) / (A.m.N + B.m.N);
-        keep(A.m.K + B.m.K, { avg, hx, hy, A, B, hA, hB, cd: centreDist([tpos(hx, hy, A), tpos(hx, hy, B)]) });
+        keep(A.m.K + B.m.K + (mir ? 1000 : 0), { avg, hx, hy, A, B, hA, hB, mir, cd: centreDist([tpos(hx, hy, A), tpos(hx, hy, B)]) });
       }
       if (onProgress && (q % 4 === 0 || q === positions.length - 1)) { onProgress({ stage: "hq", frac: (q + 1) / positions.length, found: best.size }); await tick(); }
     }
@@ -1136,7 +1190,7 @@
     // refits are capped by count, not clock time, so every machine tries the same ones
     const finals = [], refits = new Map();
     let nRefits = 0;
-    const budgets = [...best.keys()].sort((a, b) => a - b);
+    const budgets = [...best.keys()].sort((a, b) => a % 1000 - b % 1000 || a - b);
     // within a budget, estimates less than centreTie s apart (1 tile ~ 2.5 s): nearer the centre first
     for (const k of budgets) best.set(k, tieRank(best.get(k), (c) => c.avg, (c) => c.cd, opts.centreTie / 2.5));
     let total = 0;
@@ -1147,39 +1201,59 @@
       let n = 0;
       for (const c of best.get(k)) {
         if (n >= opts.perBudget) break;
-        const sig = c.hx + "," + c.hy + "|" + c.A.off.join(",") + "," + c.A.m.K + "," + c.A.m.N + "|" + c.B.off.join(",") + "," + c.B.m.K + "," + c.B.m.N;
+        const sig = c.hx + "," + c.hy + "|" + c.A.off.join(",") + "," + c.A.m.K + "," + c.A.m.N + "|" + c.B.off.join(",") + "," + c.B.m.K + "," + c.B.m.N + "|" + (c.mir || "");
         if (seen.has(sig)) continue;
         seen.add(sig);
         n++;
-        const { ctx, place, problem } = contextFor(c.hx, c.hy);
+        const { ctx, place, problem, mirror } = contextFor(c.hx, c.hy);
         const R = ctx.R;
-        // clusters with slots on obstacles are re-fitted exactly (rows 1-2 kept, rows 3+ move)
-        const fitted = (v, hits) => {
+        // clusters with slots on obstacles are re-fitted exactly (rows 1-2 kept, rows 3+ move);
+        // `toward` (a placed cluster, symmetric pairs only): the refit leans to its mirror image
+        const fitted = (v, hits, toward) => {
           if (!hits) return place(R - v.off[0], R - v.off[1], v.pat);
           // the same cluster at the same HQ comes up under several budgets: fit it once
-          const key = c.hx + "," + c.hy + "|" + v.off.join(",") + "|" + v.m.N + "," + v.m.K + "," + v.m.chir + "," + v.rot;
+          const key = c.hx + "," + c.hy + "|" + v.off.join(",") + "|" + v.m.N + "," + v.m.K + "," + v.m.chir + "," + v.rot + "," + (v.mir || "") +
+            (toward ? "|" + toward.cityA.join(",") : "");
           let cities = refits.get(key);
           if (cities === undefined) {
             if (nRefits >= opts.refitMax) return null;   // out of refits: clean clusters only
             nRefits++;
-            let pat = v.m.chir ? mirrorPattern(P) : P;
-            for (let r = 0; r < v.rot; r++) pat = pat.map(rotA);
-            const res = rowCluster(ctx, highs, R - v.off[0], R - v.off[1], pat, v.m.N, v.m.K, opts.refitTime, opts.refitNodes);
+            const res = rowCluster(ctx, highs, R - v.off[0], R - v.off[1], idealOf(v), v.m.N, v.m.K, opts.refitTime, opts.refitNodes,
+              toward ? mirror.pref(toward, c.mir) : null);
             refits.set(key, cities = res ? res.cities : null);
           }
           return cities ? place(R - v.off[0], R - v.off[1], cities) : null;
         };
-        const pa = fitted(c.A, c.hA), pb2 = pa && fitted(c.B, c.hB);
-        const pb = pa && pb2 && problem([pa, pb2]);
+        const tries = [];
+        if (!c.mir) {
+          const pa = fitted(c.A, c.hA);
+          tries.push([pa, pa && fitted(c.B, c.hB)]);
+        } else if (!c.hA && !c.hB) tries.push([fitted(c.A, 0), fitted(c.B, 0)]);
+        else {
+          // symmetric pair near obstacles (one try, refits are the slow part): the side with more
+          // obstacles is re-fitted and the other is its exact image; where the image is not clean,
+          // that side re-fits too, leaning to the image (or stays ideal if it has no obstacles)
+          const [X, hX, Y, hY] = c.hA >= c.hB ? [c.A, c.hA, c.B, c.hB] : [c.B, c.hB, c.A, c.hA];
+          const x = fitted(X, hX);
+          tries.push([x, x && (mirror.part(x, c.mir) || (hY ? fitted(Y, hY, x) : fitted(Y, 0)))]);
+        }
         done++;
         if (onProgress) { onProgress({ stage: "refine", frac: done / total }); await tick(); }
-        if (!pb) continue;
-        const ex = exactCover(highs, pb.req, pb.cover, 6, trapDist(ctx, [pa, pb2]));
-        if (!ex) continue;
-        const occ = pb.occ.slice();
-        for (const b of ex.banners) occ[b] = 1;
-        const conn = connect(ctx, occ, ex.banners);
-        finals.push({ c, ctx, parts: [pa, pb2], banners: ex.banners.concat(conn), connectors: conn.length, optimal: ex.optimal });
+        const tried = new Set();
+        for (const [pa, pb2] of tries) {
+          if (!pa || !pb2) continue;
+          const tk = pa.cityA.join(",") + "|" + pb2.cityA.join(",");
+          if (tried.has(tk)) continue;
+          tried.add(tk);
+          const pb = problem([pa, pb2]);
+          if (!pb) continue;
+          const ex = exactCover(highs, pb.req, pb.cover, 6, trapDist(ctx, [pa, pb2]), c.mir ? mirror.banner(c.mir) : null);
+          if (!ex) continue;
+          const occ = pb.occ.slice();
+          for (const b of ex.banners) occ[b] = 1;
+          const conn = connect(ctx, occ, ex.banners);
+          finals.push({ c, ctx, parts: [pa, pb2], banners: ex.banners.concat(conn), connectors: conn.length, optimal: ex.optimal, mir: c.mir || null });
+        }
       }
     }
 
@@ -1188,13 +1262,12 @@
     if (!finals.length && (rad === 0 || forced.length)) {
       let hx0 = cx, hy0 = cy;
       if (hqBlockReason(world, cx, cy)) { const p = positions.slice().sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy))[0]; hx0 = p[0]; hy0 = p[1]; }
-      const { ctx, place, problem } = contextFor(hx0, hy0);
+      const { ctx, place, problem, mirror } = contextFor(hx0, hy0);
       const R = ctx.R;
       const groups = forced.length === 2 ? [[], []] : [[], []];   // slot 0: first forced trap (or free); slot 1: second (or free)
       for (const v of variants) {
-        if (v.m.chir === undefined) continue;
-        let pat = v.m.chir ? mirrorPattern(P) : P;
-        for (let r = 0; r < v.rot; r++) pat = pat.map(rotA);
+        if (v.m.chir === undefined || v.base) continue;
+        const pat = idealOf(v);
         if (!forced.length) { groups[0].push({ v, tx: R - v.off[0], ty: R - v.off[1], pat, near: 0 }); continue; }
         forced.forEach((f, gi) => {
           const fx = f.x - ctx.ox, fy = f.y - ctx.oy;
@@ -1206,7 +1279,7 @@
       const fitGroup = async (reps, lim, base, span) => {
         // nearest offsets first; big enough for half the minimum first; at most 2 tries per size,
         // so the pairs can reach any minimum the library allows
-        const out = [], perN = new Map(), half = minC / 2;
+        const out = [], perN = new Map(), half = coreMin / 2;
         let n = 0;
         for (const rp of reps.sort((a, b) => a.near - b.near || (a.v.m.N < half) - (b.v.m.N < half) || Math.abs(a.v.m.N - half) - Math.abs(b.v.m.N - half) || a.v.m.avg - b.v.m.avg)) {
           const k = rp.v.m.N + "/" + rp.v.off.join(",");
@@ -1230,21 +1303,26 @@
       if (!forced.length) {
         const singles = await fitGroup(groups[0], 12, 0, 1);
         for (let i = 0; i < singles.length; i++) for (let j = i + 1; j < singles.length; j++) pairs.push([singles[i], singles[j]]);
+        // symmetric pairs: each fitted cluster with its mirror image
+        for (const a of singles) for (const axis of ["x", "y"]) {
+          const p = mirror.part(a.part, axis);
+          if (p && (p.tx !== a.part.tx || p.ty !== a.part.ty)) pairs.push([a, { part: p, avg: a.avg, K: a.K, N: a.N }, axis]);
+        }
       } else {
         // the free trap (one forced) tries more offsets: near ones collide with the forced cluster
         const g0 = await fitGroup(groups[0], 10, 0, 0.4), g1 = await fitGroup(groups[1], forced.length === 1 ? 30 : 10, 0.4, 0.6);
         for (const a of g0) for (const b of g1) pairs.push([a, b]);
       }
-      for (const [a, b] of pairs) {
-        if (a.N + b.N < minC) continue;
+      for (const [a, b, mir] of pairs) {
+        if (a.N + b.N < coreMin) continue;
         const pb = problem([a.part, b.part]);
         if (!pb) continue;
-        const ex = exactCover(highs, pb.req, pb.cover, 6, trapDist(ctx, [a.part, b.part]));
+        const ex = exactCover(highs, pb.req, pb.cover, 6, trapDist(ctx, [a.part, b.part]), mir ? mirror.banner(mir) : null);
         if (!ex) continue;
         const occ = pb.occ.slice();
         for (const bn of ex.banners) occ[bn] = 1;
         const conn = connect(ctx, occ, ex.banners);
-        finals.push({ c: { hx: hx0, hy: hy0 }, ctx, parts: [a.part, b.part], banners: ex.banners.concat(conn), connectors: conn.length, optimal: ex.optimal });
+        finals.push({ c: { hx: hx0, hy: hy0 }, ctx, parts: [a.part, b.part], banners: ex.banners.concat(conn), connectors: conn.length, optimal: ex.optimal, mir: mir || null });
       }
     }
     if (!finals.length) throw new Error("No clean layout found. Try another central point or a larger radius.");
@@ -1359,23 +1437,31 @@
           }
         }
       }
-      // extra slots: any free 2x2 left inside the territory within 30 s of a trap, nearest first
+      // the design's mirror axis: a symmetric pair's, or the one its traps happen to share
+      const [t0, t1] = traps;
+      const axis = f.mir || (t0[1] === t1[1] && t0[0] + t1[0] === 2 * R ? "x" : t0[0] === t1[0] && t0[1] + t1[1] === 2 * R ? "y" : null);
+      // extra slots: every free 2x2 left inside the territory within 30 s of a trap, nearest first;
+      // farther ones, nearest first, only while the cities wanted (minCities) are not reached. With
+      // a mirror axis, each slot taken brings its image along when that is free too.
       {
         const ok = (j) => terr.has(j) && !used[j] && !ctx.city[j];
+        const free4 = (x, y) => { if (x < 0 || y < 0 || x + 1 >= S || y + 1 >= S) return false; const j = y * S + x; return ok(j) && ok(j + 1) && ok(j + S) && ok(j + S + 1); };
+        const slot = (x, y) => { const d = traps.map(([tx, ty]) => Math.hypot(x + 1 - tx - 1.5, y + 1 - ty - 1.5)); return { x, y, d, k: d[0] <= d[1] ? 0 : 1 }; };
         const cand = [];
-        for (const j of terr) {
-          if (!(ok(j) && ok(j + 1) && ok(j + S) && ok(j + S + 1))) continue;
-          const x = j % S, y = (j / S) | 0;
-          const d = traps.map(([tx, ty]) => Math.hypot(x + 1 - tx - 1.5, y + 1 - ty - 1.5));
-          const k = d[0] <= d[1] ? 0 : 1;
-          if (marchSecs(d[k]) <= 30) cand.push({ j, x, y, d, k });
-        }
-        cand.sort((a, b) => a.d[a.k] - b.d[b.k]);
-        for (const c of cand) {
-          const j = c.j;
-          if (used[j] || used[j + 1] || used[j + S] || used[j + S + 1]) continue;
-          used[j] = used[j + 1] = used[j + S] = used[j + S + 1] = 1;
+        for (const j of terr) if (free4(j % S, (j / S) | 0)) cand.push(slot(j % S, (j / S) | 0));
+        cand.sort((a, b) => a.d[a.k] - b.d[b.k] || a.y - b.y || a.x - b.x);
+        const take = (c) => {
+          for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) used[(c.y + j) * S + c.x + i] = 1;
           cities.push({ x: c.x, y: c.y, d: c.d, k: c.k, extra: true });
+        };
+        for (const far of [false, true]) for (const c of cand) {
+          const secs = marchSecs(c.d[c.k]);
+          if (far ? secs <= 30 || cities.length >= minC : secs > 30) continue;
+          if (!free4(c.x, c.y)) continue;
+          take(c);
+          if (!axis) continue;
+          const [mx, my] = axis === "x" ? [2 * R + 1 - c.x, c.y] : [c.x, 2 * R + 1 - c.y];
+          if (free4(mx, my)) take(slot(mx, my));
         }
       }
       const coreCities = cities.filter((c) => !c.extra);
@@ -1386,6 +1472,25 @@
       let under = 0;
       for (const c of cities) for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) { const x = c.x + i, y = c.y + j; if (x >= R - 6 && x <= R + 8 && y >= R - 6 && y <= R + 8) under++; }
       const bl = f.banners.map((b) => [b % S, (b / S) | 0]);
+      // symmetry: share of the hive's pieces (cities, banners, traps, node, statues) whose mirror image
+      // in the HQ's middle column (or row) is the same kind of piece; pieces straddling the axis that
+      // can't be their own image (a 2x2 on a 3-wide middle) don't count either way. Best axis.
+      const pieces = cities.map((c) => ["c", c.x, c.y, 2]).concat(bl.map(([x, y]) => ["b", x, y, 1]), traps.map(([x, y]) => ["t", x, y, 3]),
+        extras.map((e) => ["e" + e.w, e.x, e.y, e.w]));
+      let sym = 0, symAxis = null;
+      for (const ax of ["x", "y"]) {
+        const have = new Set(pieces.map(([t, x, y]) => t + x + "," + y));
+        let n = 0, hit = 0;
+        for (const [t, x, y, w] of pieces) {
+          const [mx, my] = ax === "x" ? [2 * R + 3 - x - w, y] : [x, 2 * R + 3 - y - w];
+          const a = ax === "x" ? x : y, m = ax === "x" ? mx : my;
+          if (m !== a && Math.abs(m - a) < w) continue;   // overlaps its own image
+          n++;
+          if (have.has(t + mx + "," + my)) hit++;
+        }
+        const v = n ? hit / n : 0;
+        if (v > sym) { sym = v; symAxis = ax; }
+      }
       const rects = [[R - 6, R - 6, R + 8, R + 8]].concat(bl.map(([x, y]) => [x - 3, y - 3, x + 3, y + 3]));
       const order = [], dn = new Uint8Array(rects.length); dn[0] = 1;
       let frontier = [0];
@@ -1402,6 +1507,7 @@
           secs: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k && !c.extra).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v) }; }),
           secsAll: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v), n: v.length }; }),
           hqShift: [ctx.ox + R - cx, ctx.oy + R - cy],
+          sym, symAxis, symPair: !!f.mir, short: Math.max(0, minC - cities.length),
         },
       };
       const gd = toGameDesign(d);
@@ -1412,14 +1518,17 @@
     // efficiency first: mean march time (KSMapper's rounded seconds, to 0.1 s), then fewer banners
     const eff = (d) => { const n = d.stats.perTrap; return Math.round(((n[0] * d.stats.secs[0].avg + n[1] * d.stats.secs[1].avg) / (n[0] + n[1])) * 10) / 10; };
     // efficiency first, but a banner is worth `bannerCost` seconds of average march time
-    const score = (d) => { const n = d.stats.perTrap; return (n[0] * d.stats.secs[0].avg + n[1] * d.stats.secs[1].avg) / (n[0] + n[1]) + opts.bannerCost * d.k; };
+    // and full asymmetry is worth `symCost` seconds (players read aligned, mirrored hives far more easily)
+    const score = (d) => { const n = d.stats.perTrap; return (n[0] * d.stats.secs[0].avg + n[1] * d.stats.secs[1].avg) / (n[0] + n[1]) + opts.bannerCost * d.k + opts.symCost * (1 - d.stats.sym); };
     // a design with room for every statue and the node comes first, whatever its score; designs
     // within centreTie s of the best left: traps nearer the map centre first
-    const order = (a, b) => a.missing.length - b.missing.length || score(a) - score(b) || a.k - b.k || a.stats.coreAvg - b.stats.coreAvg;
+    // then the ones with all the cities wanted
+    const grp = (d) => 2 * d.missing.length + (d.stats.short ? 1 : 0);
+    const order = (a, b) => grp(a) - grp(b) || score(a) - score(b) || a.k - b.k || a.stats.coreAvg - b.stats.coreAvg;
     const rank = (list) => {
       const out = [];
-      for (const m of [...new Set(list.map((d) => d.missing.length))].sort((a, b) => a - b))
-        out.push(...tieRank(list.filter((d) => d.missing.length === m).sort(order), score, (d) => d.stats.centre, opts.centreTie));
+      for (const m of [...new Set(list.map(grp))].sort((a, b) => a - b))
+        out.push(...tieRank(list.filter((d) => grp(d) === m).sort(order), score, (d) => d.stats.centre, opts.centreTie));
       return out;
     };
     designs.splice(0, designs.length, ...rank(designs));
