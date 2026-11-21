@@ -590,7 +590,7 @@ function pick(i) {
     ["HQ", d.hq.join(",") + (s.hqShift && (s.hqShift[0] || s.hqShift[1]) ? " (moved " + s.hqShift.join(",") + ")" : "")],
     ["BT1", d.traps[0].join(",")], ["BT2", d.traps[1].join(",")],
     ["Farthest slot", s.coreMax.toFixed(2)],
-    ["Traps from the map centre (mean, tiles)", s.centre != null ? s.centre.toFixed(1) : "–"],
+    ["Cities from Fertile Land (mean, tiles)", s.centre != null ? s.centre.toFixed(1) : "–"],
     ["Slot tiles under HQ territory", s.underHq + " of " + s.coreTiles],
     ["Territory tiles", d.territory],
   ].map(([a, b]) => "<div><span>" + a + "</span><span>" + b + "</span></div>").join("") +

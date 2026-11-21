@@ -974,9 +974,11 @@
      the best per banner budget go to an exact banner cover. Results sorted by average distance. */
   async function solve(world, cx, cy, opts, onProgress, highs) {
     opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 0, bannerCost: 0.1, centreTie: 0.2, symCost: 1, extraSecs: 31 }, opts || {});
-    // nearer the map's centre is better (Fertile Land gives cities a big bonus), but only as a
-    // tie-break: the traps' mean distance to it (Chebyshev, like the zones)
-    const centreDist = (traps) => traps.reduce((a, t) => a + Math.max(Math.abs(t[0] + 1.5 - 600), Math.abs(t[1] + 1.5 - 600)), 0) / traps.length;
+    // nearer Fertile Land is better (it gives cities a big bonus), but only as a tie-break: the
+    // distance of a w x w piece to the Fertile square (Chebyshev, like the zones; 0 inside it)
+    const fertDist = (x, y, w) => { const [x0, y0, x1, y1] = ZONES.fertile; return Math.max(0, x0 - (x + w - 1), x - x1, y0 - (y + w - 1), y - y1); };
+    // while scanning: the traps' mean distance; for designs: every city's (stats.centre)
+    const centreDist = (traps) => traps.reduce((a, t) => a + fertDist(t[0], t[1], 3), 0) / traps.length;
     // without refits (the default: they cost a lot of time for ~1% of march time and symmetry) only
     // clean clusters are kept, so the places per budget go to designs that can be built as they are
     const maxHits = opts.refitMax ? opts.maxHits : 0;
@@ -1364,7 +1366,7 @@
     //     brings into territory. Kept when the mean march gain beats `bannerCost` per banner; banners
     //     the moves leave useless come down. Repeated while it pays. The polished design is added
     //     next to the original, so the ranking (loose cities, symmetry, score) picks.
-    //     Only the most promising designs are polished (mean march + banner cost, best `polishTop`).
+    //     Every design is polished (`polishTop` limits it to the most promising: mean march + banner cost).
     if (opts.polish !== false) {
       const est = (f) => {
         const S = f.ctx.S;
@@ -1373,7 +1375,7 @@
         return sum / n + opts.bannerCost * f.banners.length;
       };
       const extra = [];
-      for (const f of finals.slice().sort((a, b) => est(a) - est(b)).slice(0, opts.polishTop ?? 12)) { const p = polish(f); if (p) extra.push(p); }
+      for (const f of finals.slice().sort((a, b) => est(a) - est(b)).slice(0, opts.polishTop ?? Infinity)) { const p = polish(f); if (p) extra.push(p); }
       finals.push(...extra);
     }
     function polish(f) {
@@ -1773,10 +1775,9 @@
         },
       };
       const gd = toGameDesign(d);
-      gd.stats.centre = centreDist(gd.traps);
+      gd.stats.centre = gd.cities.reduce((a, c) => a + fertDist(c.x, c.y, 2), 0) / gd.cities.length;
       return gd;
     });
-    // best per banner count first so the trade-off is visible, then the rest; all sorted by average
     // efficiency first: mean march time (KSMapper's rounded seconds, to 0.1 s), then fewer banners
     const eff = (d) => { const n = d.stats.perTrap; return Math.round(((n[0] * d.stats.secs[0].avg + n[1] * d.stats.secs[1].avg) / (n[0] + n[1])) * 10) / 10; };
     // efficiency first, but a banner is worth `bannerCost` seconds of average march time
@@ -1796,11 +1797,16 @@
     };
     designs.splice(0, designs.length, ...rank(designs));
     if (designs.some((d) => !d.missing.length)) for (let i = designs.length - 1; i >= 0; i--) if (designs[i].missing.length) designs.splice(i, 1);
-    const out = [], usedK = new Set(), sigs = new Set();
-    const sig = (d) => d.hq.join(",") + "|" + d.traps.map((t) => t.join(",")).join("|");
-    for (const d of designs) if (!usedK.has(d.k)) { usedK.add(d.k); sigs.add(sig(d)); out.push(d); }
-    for (const d of designs) { if (out.length >= opts.designs) break; if (!sigs.has(sig(d))) { sigs.add(sig(d)); out.push(d); } }
-    return rank(out).slice(0, Math.max(opts.designs, usedK.size));
+    // the list follows the ranking; a design that is a better one moved by a tile or two (same traps
+    // relative to the HQ, HQ within 2 tiles) is left out
+    const out = [];
+    const rel = (d) => d.traps.map((t) => (t[0] - d.hq[0]) + "," + (t[1] - d.hq[1])).join("|");
+    for (const d of designs) {
+      if (out.length >= opts.designs) break;
+      if (out.some((e) => rel(e) === rel(d) && Math.max(Math.abs(e.hq[0] - d.hq[0]), Math.abs(e.hq[1] - d.hq[1])) <= 2)) continue;
+      out.push(d);
+    }
+    return out;
   }
 
   function toGameDesign(d) {
