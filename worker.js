@@ -18,6 +18,7 @@ self.onmessage = async (e) => {
   if (e.data.kind === "fence") return fence(e.data);
   if (e.data.kind === "eval-init" || e.data.kind === "eval") return evalRun(e.data);
   if (e.data.kind === "hscan") return hscanRun(e.data);
+  if (e.data.kind === "hpolish") return hpolishRun(e.data);
   const { hx, hy, opts } = e.data;
   let pool = null;
   try {
@@ -27,7 +28,10 @@ self.onmessage = async (e) => {
     pool = await makePool(null);
     const scanPool = pool ? (jobs, onJob) => pool.run(jobs.map(([q0, q1]) => ({ kind: "hscan", hx, hy, opts, q0, q1 })), onJob).then((r) => r.map((m) => m.cands)) : null;
     if (scanPool) scanPool.size = pool.size;
-    const designs = await Hive.solve(world, hx, hy, Object.assign({ library: self.ROWLIB, scanPool }, opts), (p) => {
+    // the polish of the designs, spread the same way
+    const polishPool = pool ? (jobs, onJob) => pool.run(jobs.map((list) => ({ kind: "hpolish", opts, list })), onJob).then((r) => r.map((m) => m.res)) : null;
+    if (polishPool) polishPool.size = pool.size;
+    const designs = await Hive.solve(world, hx, hy, Object.assign({ library: self.ROWLIB, scanPool, polishPool }, opts), (p) => {
       const now = Date.now();
       if (p.stage !== "search" || now - last > 150) { last = now; self.postMessage({ type: "progress", p }); }
     }, highs);
@@ -38,6 +42,16 @@ self.onmessage = async (e) => {
     if (pool) pool.close();
   }
 };
+
+/* A helper worker's share of the polish: plain designs in, polished ones (or null) out. */
+async function hpolishRun(m) {
+  try {
+    await load();
+    self.postMessage({ id: m.id, res: Hive.polishPlain(world, m.opts, m.list) });
+  } catch (err) {
+    self.postMessage({ id: m.id, res: [], error: String((err && err.message) || err) });
+  }
+}
 
 /* A helper worker's share of the hive's HQ scan: positions q0..q1-1, its best per budget. */
 async function hscanRun(m) {

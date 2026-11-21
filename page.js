@@ -534,7 +534,7 @@ $("run").onclick = () => {
     const m = e.data;
     if (m.type === "progress") {
       const p = m.p;
-      const txt = { modules: "Solving the ideal trap cluster…", screen: "Checked trap positions (" + (p.found || 0) + " candidates)…", refine: "Fitting banners and re-fitting clusters around obstacles…", repair: "Fitting clusters around obstacles…", hq: "Trying HQ positions…" }[p.stage] || p.stage;
+      const txt = { modules: "Solving the ideal trap cluster…", screen: "Checked trap positions (" + (p.found || 0) + " candidates)…", refine: "Fitting banners and re-fitting clusters around obstacles…", repair: "Fitting clusters around obstacles…", hq: "Trying HQ positions…", polish: "Polishing designs…" }[p.stage] || p.stage;
       $("runmsg").innerHTML = log.join("<br>") + (log.length ? "<br>" : "") + txt;
       $("prog").style.width = Math.round((p.frac || 0) * 100) + "%";
     } else if (m.type === "warn") {
