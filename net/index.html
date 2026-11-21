@@ -61,7 +61,7 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.21.5</div>
+    <div class="msg" id="version">Version 2026.11.21.6</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <details class="sec" open><summary>Your alliance</summary>
@@ -132,23 +132,25 @@
       <details class="sec"><summary>Outposts reached</summary>
       <table id="goals"></table></details>
       <details class="sec"><summary>KSMapper CSV (build order)</summary>
-      <div class="msg">Yellow: to build; green: you already have a banner there. Light shade: captures resources; strong shade: empty. Import it into an empty KSMapper map (the tag clashes with your own network).</div>
+      <div class="msg">Same colours as the map: green, already built; yellow, to build; light shade captures resources, strong shade is empty. Banners taken down are not in it. Import it into an empty KSMapper map (the tag clashes with your own network).</div>
       <textarea id="csv" readonly></textarea>
       <div class="row" style="margin-top:6px"><button id="copy">Copy CSV</button><button id="dl">Download</button><span class="msg" id="copymsg"></span></div></details>
     </div>
     <div id="current" hidden>
       <details class="sec"><summary>Current network (from the CSV)</summary>
       <div class="stats" id="curstats"></div>
-      <label class="check"><input id="showcur" type="checkbox"> Show it on the map instead of the result</label></details>
+      <label class="check"><input id="showcur" type="checkbox"> Show it on the map on its own, instead of the result</label></details>
     </div>
 
     <details class="sec"><summary>Legend</summary>
     <div class="legend">
       <div class="sw" style="background:#8e44ad"></div><div>Your HQ (15x15 outlined)</div>
-      <div class="sw" style="background:#2ecc71"></div><div>Banner that captures resources</div>
-      <div class="sw" style="background:#e67e22"></div><div>Empty banner (no captured node depends on it)</div>
-      <div class="sw" style="background:#2ecc71;border:2px solid #fff"></div><div>Banner you already have there</div>
-      <div class="sw" style="background:rgba(245,197,66,.45)"></div><div>Your territory</div>
+      <div class="sw" style="background:#8fe08f"></div><div>Banner already built (from the CSV); strong green: empty</div>
+      <div class="sw" style="background:#ffe680"></div><div>New banner; strong yellow: empty (no captured node depends on it)</div>
+      <div class="sw" style="background:rgba(231,120,120,.75)"></div><div>Banner already built, taken down by this network</div>
+      <div class="sw" style="background:rgba(90,200,100,.6)"></div><div>Territory of the HQ and of the banners already built</div>
+      <div class="sw" style="background:rgba(245,180,40,.6)"></div><div>Territory only new banners hold</div>
+      <div class="sw" style="background:rgba(231,90,90,.5)"></div><div>Territory lost with the banners taken down</div>
       <div class="sw" style="background:#fff;border:2px solid #111"></div><div>Captured resource node (white outline)</div>
       <div class="sw" style="background:linear-gradient(90deg,#a04000 20%,#9a7d0a 20% 40%,#1a5276 40% 60%,#880e4f 60% 80%,#117a65 80%)"></div><div>Outposts by kind, as in KSMapper; the ones reached filled and outlined</div>
       <div class="sw" style="background:#27ae60;border:2px solid #fff"></div><div>Forced outpost</div>

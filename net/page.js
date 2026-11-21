@@ -166,12 +166,28 @@ function enemyMask() {
 let enMask = null;
 
 /* The network on the map: the selected result, or the CSV's current network. */
+/* The network on the map. With a result: its banners, each marked kept (already in the CSV's network)
+   or new, plus the CSV's banners it takes down. Without one (or with "show the current network"):
+   the CSV's network, all kept. */
 function shown() {
-  if ($("showcur").checked && current && own.banners.length) return { banners: own.banners, empty: current.emptyFlags, captured: current.captured, outposts: current.outposts, isCurrent: true };
   const d = results[sel];
-  if (d) return { banners: d.design, empty: d.emptyFlags, captured: d.captured, outposts: d.outposts };
-  return null;
+  if ((!d || $("showcur").checked) && own.banners.length) {
+    const c = current;
+    return { banners: own.banners, empty: c ? c.emptyFlags : null, captured: c ? c.captured : [], outposts: c ? c.outposts : [], isCurrent: true,
+      kept: own.banners.map(() => true), removed: [] };
+  }
+  if (!d) return null;
+  if (!d._kept) {
+    const have = new Set(own.banners.map(key)), mine = new Set(d.design.map(key));
+    d._kept = d.design.map((b) => have.has(key(b)));
+    d._removed = own.banners.filter((b) => !mine.has(key(b)));
+  }
+  return { banners: d.design, empty: d.emptyFlags, captured: d.captured, outposts: d.outposts, kept: d._kept, removed: d._removed };
 }
+// colours: green = already built (CSV), yellow = new, faded red = in the CSV but taken down;
+// light shade = captures resources, strong shade = empty (as in the exported CSV)
+const COL = { kept: "#8fe08f", keptEmpty: "#2f9e44", fresh: "#ffe680", freshEmpty: "#f1c40f", removed: "rgba(231,120,120,.75)" };
+const SHADE = { kept: "rgba(90,200,100,.38)", fresh: "rgba(245,180,40,.42)", removed: "rgba(231,90,90,.28)" };
 function territoryOf(banners) {
   const s = new Set();
   if (!hq) return s;
@@ -181,6 +197,21 @@ function territoryOf(banners) {
   return s;
 }
 let terrCache = { ref: null, set: null };
+/* Territory split three ways: the HQ's and the kept banners' (green), what only new banners hold
+   (yellow), what only taken-down banners held (faded red). */
+function territories(net) {
+  const keptB = [], newB = [];
+  net.banners.forEach((b, i) => (net.kept[i] ? keptB : newB).push(b));
+  const kept = territoryOf(keptB);
+  const fresh = new Set(), gone = new Set();
+  for (const c of territoryOf(newB)) if (!kept.has(c)) fresh.add(c);
+  if (net.removed.length) {
+    const all = territoryOf(net.banners);
+    const sq = (x0, y0, x1, y1) => { for (let y = Math.max(0, y0); y <= Math.min(M - 1, y1); y++) for (let x = Math.max(0, x0); x <= Math.min(M - 1, x1); x++) { const c = y * M + x; if (!zoneMask[c] && !(enMask && enMask[c]) && !all.has(c)) gone.add(c); } };
+    for (const [x, y] of net.removed) sq(x - 3, y - 3, x + 3, y + 3);
+  }
+  return { kept, fresh, gone };
+}
 
 function draw() {
   if (!cv.width) return;
@@ -196,9 +227,11 @@ function draw() {
   // enemy ground
   for (const e of enemies) { const [x0, y0, w] = enemySq(e); rect(x0, y0, w, w, "rgba(231,76,60,.28)", null); }
   if (net) {
-    if (terrCache.ref !== net.banners) terrCache = { ref: net.banners, set: territoryOf(net.banners) };
-    g.fillStyle = "rgba(245,180,40,.42)";
-    for (const c of terrCache.set) if (!world.terrain[c]) g.fillRect(c % M, (c / M) | 0, 1, 1);
+    if (terrCache.ref !== net.banners || terrCache.n !== net.removed.length) terrCache = { ref: net.banners, n: net.removed.length, set: territories(net) };
+    const paint = (set, col) => { g.fillStyle = col; for (const c of set) if (!world.terrain[c]) g.fillRect(c % M, (c / M) | 0, 1, 1); };
+    paint(terrCache.set.gone, SHADE.removed);
+    paint(terrCache.set.fresh, SHADE.fresh);
+    paint(terrCache.set.kept, SHADE.kept);
   }
   // outposts: forced / excluded / reached
   const reached = new Set(net ? net.outposts.map((o) => o.x + "," + o.y) : []);
@@ -215,8 +248,6 @@ function draw() {
   }
   const edge = px >= 6 ? "rgba(0,0,0,.5)" : null;
   if (net) for (const [x, y] of net.captured) rect(x, y, 2, 2, null, "#fff", 2);
-  // the current network (when the result is shown, or nothing else)
-  if (own.banners.length && !net) { const z = Math.max(1, 4 * dpr() / px), o = (z - 1) / 2; for (const [x, y] of own.banners) rect(x - o, y - o, z, z, "#7f8c8d", edge); }
   // banners as tile squares (as in the hive generator), grown at low zoom so the network still reads
   const sz = Math.max(1, 4 * dpr() / px), off = (sz - 1) / 2;
   const sq = (x, y, fill, ring) => {
@@ -224,8 +255,11 @@ function draw() {
     g.strokeStyle = ring || "rgba(0,0,0,.55)"; g.lineWidth = (ring ? 2 : 1) * dpr() / px; g.strokeRect(x - off, y - off, sz, sz);
   };
   if (net) {
-    const have = new Set(own.banners.map(key));
-    net.banners.forEach(([x, y], i) => sq(x, y, net.empty && net.empty[i] ? "#e67e22" : "#2ecc71", !net.isCurrent && have.has(x + "," + y) ? "#fff" : null));
+    for (const [x, y] of net.removed) sq(x, y, COL.removed, "rgba(120,30,30,.6)");
+    net.banners.forEach(([x, y], i) => {
+      const empty = net.empty && net.empty[i];
+      sq(x, y, net.kept[i] ? (empty ? COL.keptEmpty : COL.kept) : (empty ? COL.freshEmpty : COL.fresh));
+    });
   }
   for (const e of enemies) if (e.type === "banner") sq(e.x, e.y, "#c0392b", "#641e16");
   for (const e of enemies) if (e.type === "hq") rect(e.x, e.y, 3, 3, "#c0392b", "#641e16");
@@ -281,10 +315,12 @@ function describeAt(x, y) {
   const net = shown();
   if (hq && inBox(hq[0], hq[1], 3)) out.push("Your HQ " + key(hq));
   if (net) {
-    const have = new Set(own.banners.map(key));
     net.banners.forEach(([bx, by], i) => {
-      if (bx === x && by === y) out.push((net.isCurrent ? "Current banner" : "Banner " + (i + 1) + " in build order") + ", " + (net.empty[i] ? "empty" : "captures resources") + (!net.isCurrent && have.has(key([bx, by])) ? ", already built" : ""));
+      if (bx !== x || by !== y) return;
+      const what = net.isCurrent ? "Current banner" : (net.kept[i] ? "Banner already built (kept)" : "New banner") + ", " + (i + 1) + " in build order";
+      out.push(what + (net.empty ? ", " + (net.empty[i] ? "empty" : "captures resources") : ""));
     });
+    for (const [bx, by] of net.removed) if (bx === x && by === y) out.push("Banner already built, taken down in this network");
   }
   for (const e of enemies) {
     if (e.type === "hq" ? inBox(e.x, e.y, 3) : (e.x === x && e.y === y)) out.push("Enemy " + (e.type === "hq" ? "HQ " : "banner ") + key([e.x, e.y]) + (e.src === "csv" ? " (from the CSV)" : ""));
@@ -426,10 +462,18 @@ $("loadcsv").onclick = () => {
   }
   const plainsHq = rows.some((r) => r[0] === "hq" && r[3] === tag && inPlains(+r[1], +r[2]));
   $("csvmsg").textContent = tag + ": " + own.banners.length + " banners" + (h ? ", HQ " + h[1] + "," + h[2] : ", no Badland HQ") + (plainsHq ? " (Plains HQ left out)" : "") + (ne ? "; " + ne + " enemy banners / HQs from other tags" : "") + ".";
-  results = []; sel = -1; $("results").hidden = true;
+  results = []; sel = -1; $("results").hidden = true; current = null;
   if (h) setHQ(+h[1], +h[2], true); else changed();
   fit();
+  evaluateCurrent();
 };
+/* Score the CSV's network (same targets, enemies and rules as a run) to shade and list it. */
+function evaluateCurrent() {
+  if (!hq || !own.banners.length) return;
+  const ev = new Worker("worker.js");
+  ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; showCurrent(); terrCache.ref = null; draw(); } ev.terminate(); };
+  ev.postMessage({ kind: "evaluate", hx: hq[0], hy: hq[1], banners: own.banners, opts: options() });
+}
 $("clearcsv").onclick = () => {
   $("csvin").value = ""; own = { tag: "", banners: [] }; current = null;
   enemies = enemies.filter((e) => e.src !== "csv");
@@ -521,12 +565,8 @@ $("run").onclick = () => {
       $("runmsg").innerHTML = '<span class="err">' + m.message + "</span>";
     }
   };
-  // the current network first (same targets, same enemies), then the run
-  if (own.banners.length) {
-    const ev = new Worker("worker.js");
-    ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; showCurrent(); } ev.terminate(); };
-    ev.postMessage({ kind: "evaluate", hx: hq[0], hy: hq[1], banners: own.banners, opts });
-  }
+  // the current network scored again with this run's settings, then the run
+  evaluateCurrent();
   worker.postMessage({ hx: hq[0], hy: hq[1], opts });
 };
 
@@ -536,7 +576,8 @@ function statsHtml(d) {
   const rows = [
     ["Banners", d.banners],
     ["Empty banners", d.empty],
-    ["Already built / new to build", (d.kept || 0) + " / " + (d.banners - (d.kept || 0))],
+    ["Already built (kept) / new to build", (d.kept || 0) + " / " + (d.banners - (d.kept || 0))],
+    ...(d === current || !own.banners.length ? [] : [["Already built, taken down", own.banners.length - (d.kept || 0)]]),
     ["Cost (banners, kept ones cheaper, + extra for empties)", d.cost.toFixed(1)],
     ["Nodes bread / wood / stone / iron", nodesTxt(d.nodes)],
     ["Per hour", Net.TYPES.map((t) => kph(d.nodes[t])).join(" / ")],
