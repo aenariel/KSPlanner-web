@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KSPlanner Banner Network</title>
+<style>
+  :root { --bg:#14171c; --panel:#1d2129; --line:#2c323d; --text:#e6e8eb; --mute:#9aa3ae; --acc:#f5c542; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
+  #app { display:grid; grid-template-columns: 340px 1fr; height:100%; }
+  #side { background:var(--panel); border-right:1px solid var(--line); overflow:auto; padding:14px; }
+  #mapwrap { position:relative; overflow:hidden; }
+  canvas#map { display:block; width:100%; height:100%; cursor:crosshair; touch-action:none; }
+  h1 { font-size:16px; margin:0 0 10px; color:var(--acc); }
+  h2 { font-size:13px; margin:16px 0 6px; color:var(--mute); text-transform:uppercase; letter-spacing:.05em; }
+  label { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:5px 0; color:var(--mute); }
+  input, select { background:#0f1216; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 7px; font:inherit; width:96px; }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .row input { width:70px; }
+  .ratio input { width:52px; }
+  button { background:#2a3140; color:var(--text); border:1px solid #3a4352; border-radius:6px; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { background:#343c4d; }
+  button.primary { background:var(--acc); color:#1a1a1a; border-color:var(--acc); font-weight:600; width:100%; padding:9px; margin-top:8px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .modes { display:grid; grid-template-columns:1fr 1fr; gap:4px; }
+  .modes button.on { background:var(--acc); color:#111; border-color:var(--acc); }
+  .msg { margin-top:8px; color:var(--mute); min-height:20px; }
+  .err { color:#ff7b72; }
+  .warn { color:#f0ad4e; }
+  .ok { color:#2ecc71; }
+  .bar { height:12px; background:#0f1216; border:1px solid #2ecc71; border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:#2ecc71; transition:width .3s; }
+  .design { display:block; width:100%; text-align:left; margin:4px 0; }
+  .design.sel { outline:2px solid var(--acc); }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  td, th { padding:2px 4px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:var(--mute); font-weight:500; }
+  textarea { width:100%; height:110px; background:#0f1216; color:var(--text); border:1px solid var(--line); border-radius:6px; font:11px/1.3 ui-monospace, monospace; }
+  label.check { justify-content:flex-start; gap:6px; }
+  label.check input { width:auto; }
+  #hover { position:absolute; left:8px; bottom:8px; right:8px; background:rgba(0,0,0,.65); padding:4px 8px; border-radius:6px; font:12px ui-monospace, monospace; pointer-events:none; }
+  #zoom { position:absolute; right:8px; top:8px; display:flex; flex-direction:column; gap:4px; }
+  #modebadge { position:absolute; left:8px; top:8px; background:rgba(0,0,0,.65); padding:4px 8px; border-radius:6px; font-size:12px; pointer-events:none; }
+  .legend { display:grid; grid-template-columns: 14px 1fr; gap:3px 6px; font-size:12px; color:var(--mute); align-items:center; }
+  .sw { width:12px; height:12px; border-radius:2px; }
+  .stats div { display:flex; justify-content:space-between; gap:8px; }
+  .stats span:first-child { color:var(--mute); }
+  .list { font-size:12px; }
+  .kinds { display:grid; grid-template-columns:1fr 1fr; gap:0 8px; font-size:12px; }
+  .kinds label { margin:2px 0; }
+  .list div { display:flex; justify-content:space-between; align-items:center; gap:6px; padding:2px 0; border-bottom:1px solid var(--line); }
+  .list button { padding:1px 6px; font-size:11px; }
+  details.sec { margin:12px 0 0; }
+  details.sec > summary { font-size:13px; font-weight:bold; color:var(--mute); text-transform:uppercase; letter-spacing:.05em; cursor:pointer; padding:4px 0; }
+  details.sec[open] > summary { margin-bottom:6px; }
+  @media (max-width: 760px) { #app { grid-template-columns: 1fr; grid-template-rows: 55vh auto; } #mapwrap { order:-1; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>Banner network</h1>
+    <div class="msg" id="version">Version 2026.11.21.2</div>
+    <div class="msg" id="loadmsg">Loading map…</div>
+
+    <details class="sec" open><summary>Your alliance</summary>
+    <div class="msg">Paste a KSMapper CSV (optional): its Badland HQ is used, its banners are shown as the current network, and banners and HQs of other tags become enemy territory.</div>
+    <textarea id="csvin" placeholder="type,X,Y,label,colour,seq"></textarea>
+    <label>Alliance tag <input id="tag" type="text" value="" placeholder="from the CSV"></label>
+    <label class="check"><input id="othersEnemy" type="checkbox" checked> Other tags in the CSV are enemies</label>
+    <div class="row"><button id="loadcsv">Load CSV</button><button id="clearcsv">Clear</button></div>
+    <div class="msg" id="csvmsg"></div>
+    <h2>Badland HQ (lower-left tile)</h2>
+    <div class="row">X <input id="hx" type="number" min="0" max="1199"> Y <input id="hy" type="number" min="0" max="1199"> <button id="go">Set</button></div>
+    <div class="msg" id="hqmsg">Type the coordinates, load a CSV, or pick "HQ" below and click the map.</div>
+    </details>
+
+    <details class="sec" open><summary>Click on the map</summary>
+    <div class="modes">
+      <button id="m-view" data-mode="view">Move only</button>
+      <button id="m-hq" data-mode="hq">HQ</button>
+      <button id="m-out" data-mode="outpost">Outposts</button>
+      <button id="m-eb" data-mode="ebanner">Enemy banner</button>
+      <button id="m-eh" data-mode="ehq">Enemy HQ</button>
+    </div>
+    <div class="msg" id="modehelp"></div>
+    </details>
+
+    <details class="sec" open><summary>Resource targets</summary>
+    <div class="row ratio">Ratio <input id="rb" type="number" value="3" min="0" max="20" title="bread">:<input id="rw" type="number" value="3" min="0" max="20" title="wood">:<input id="rs" type="number" value="2" min="0" max="20" title="stone">:<input id="ri" type="number" value="1" min="0" max="20" title="iron"></div>
+    <div class="msg" style="margin-top:0">bread : wood : stone : iron</div>
+    <label>Base resource <select id="btype"><option value="bread">bread</option><option value="wood">wood</option><option value="stone">stone</option><option value="iron" selected>iron</option></select></label>
+    <label>Base amount per hour <input id="bper" type="number" value="50000" min="0" step="1000"></label>
+    <div class="msg" id="tgtmsg"></div>
+    </details>
+
+    <details class="sec" open><summary>Outposts</summary>
+    <div class="msg">Pick "Outposts" and click one: normal → forced (the network must reach it) → excluded (never used) → normal. Without a forced one, the network takes the cheapest outpost of each kind.</div>
+    <div class="list" id="outlist"></div>
+    <div class="msg">Kinds to reach (a forced outpost is reached even if its kind is off):</div>
+    <div class="kinds" id="kinds"></div>
+    <div class="row" style="margin-top:4px"><button id="kall">All</button><button id="knone">None</button></div>
+    <div class="row" style="margin-top:6px"><button id="clearout">Clear forced / excluded</button></div>
+    </details>
+
+    <details class="sec" open><summary>Enemies</summary>
+    <div class="msg">Pick "Enemy banner" or "Enemy HQ" and click a tile: it adds one there, or removes the one already there. Their squares are another alliance's ground: no banner of ours on it, and it is never ours.</div>
+    <div class="msg" id="enmsg"></div>
+    <div class="row"><button id="clearen">Clear enemies</button></div>
+    </details>
+
+    <details class="sec"><summary>Search</summary>
+    <label>Variants <input id="variants" type="number" value="4" min="1" max="16"></label>
+    <label>Search time per variant (s) <input id="secs" type="number" value="30" min="0" max="600"></label>
+    <label>An empty banner costs (banners) <input id="ew" type="number" value="1.5" min="1" max="5" step="0.1"></label>
+    <label>Banner limit <input id="cap" type="number" value="285" min="20" max="285"></label>
+    <div class="msg">Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search time, which keeps lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
+    </details>
+
+    <button class="primary" id="run" disabled>Design network</button>
+    <div class="bar"><div id="prog"></div></div>
+    <div class="msg" id="runmsg"></div>
+
+    <div id="results" hidden>
+      <details class="sec" open><summary>Networks (cheapest first)</summary>
+      <div id="designs"></div></details>
+      <details class="sec" open><summary>Selected network</summary>
+      <div class="stats" id="stats"></div></details>
+      <details class="sec"><summary>Outposts reached</summary>
+      <table id="goals"></table></details>
+      <details class="sec"><summary>KSMapper CSV (build order)</summary>
+      <div class="msg">Yellow: to build; green: you already have a banner there. Light shade: captures resources; strong shade: empty. Import it into an empty KSMapper map (the tag clashes with your own network).</div>
+      <textarea id="csv" readonly></textarea>
+      <div class="row" style="margin-top:6px"><button id="copy">Copy CSV</button><button id="dl">Download</button><span class="msg" id="copymsg"></span></div></details>
+    </div>
+    <div id="current" hidden>
+      <details class="sec"><summary>Current network (from the CSV)</summary>
+      <div class="stats" id="curstats"></div>
+      <label class="check"><input id="showcur" type="checkbox"> Show it on the map instead of the result</label></details>
+    </div>
+
+    <details class="sec"><summary>Legend</summary>
+    <div class="legend">
+      <div class="sw" style="background:#8e44ad"></div><div>Your HQ (15x15 outlined)</div>
+      <div class="sw" style="background:#2ecc71"></div><div>Banner that captures resources</div>
+      <div class="sw" style="background:#e67e22"></div><div>Empty banner (no captured node depends on it)</div>
+      <div class="sw" style="background:#2ecc71;border:2px solid #fff"></div><div>Banner you already have there</div>
+      <div class="sw" style="background:rgba(245,197,66,.45)"></div><div>Your territory</div>
+      <div class="sw" style="background:#fff;border:2px solid #111"></div><div>Captured resource node (white outline)</div>
+      <div class="sw" style="background:#9b59b6"></div><div>Outpost reached by the network</div>
+      <div class="sw" style="background:#27ae60;border:2px solid #fff"></div><div>Forced outpost</div>
+      <div class="sw" style="background:#555;border:2px solid #ff3b30"></div><div>Excluded outpost</div>
+      <div class="sw" style="background:rgba(231,76,60,.45)"></div><div>Enemy territory (banner 7x7, HQ 15x15)</div>
+      <div class="sw" style="background:#7f8c8d;border:1px solid #2c3e50"></div><div>Current network (from the CSV)</div>
+      <div class="sw" style="background:linear-gradient(90deg,#d6b43c 25%,#46823c 25% 50%,#969696 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
+      <div class="sw" style="background:rgb(128,116,100)"></div><div>Mountain</div>
+      <div class="sw" style="background:rgb(92,150,210)"></div><div>Lake</div>
+      <div class="sw" style="background:#e2e7d2;border:1px solid #888"></div><div>Badlands</div>
+      <div class="sw" style="background:#c9dcb9"></div><div>Plains</div>
+      <div class="sw" style="background:#a9c79c"></div><div>Fertile Land</div>
+    </div></details>
+  </div>
+  <div id="mapwrap">
+    <canvas id="map"></canvas>
+    <div id="modebadge"></div>
+    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="fit" title="Fit the network">Fit</button></div>
+    <div id="hover"></div>
+  </div>
+</div>
+<script>
+/* hive.js and the map data live in different places in the repo (web/hive, data), on the public
+   site (its root, this page in net/) and in a single-folder artifact: try each, then start. */
+(function () {
+  const load = (src) => new Promise((ok, fail) => { const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = fail; document.body.appendChild(s); });
+  const first = (list) => list.reduce((p, src) => p.catch(() => load(src)), Promise.reject());
+  first(["../hive/hive.js", "../hive.js", "hive.js"]).then(() => load("net.js")).then(() => load("page.js"))
+    .catch(() => { document.getElementById("loadmsg").innerHTML = '<span class="err">Could not load the solver scripts.</span>'; });
+})();
+</script>
+</body>
+</html>
