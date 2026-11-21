@@ -61,7 +61,7 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.21.2</div>
+    <div class="msg" id="version">Version 2026.11.21.5</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <details class="sec" open><summary>Your alliance</summary>
@@ -114,6 +114,8 @@
     <label>Variants <input id="variants" type="number" value="4" min="1" max="16"></label>
     <label>Search time per variant (s) <input id="secs" type="number" value="30" min="0" max="600"></label>
     <label>An empty banner costs (banners) <input id="ew" type="number" value="1.5" min="1" max="5" step="0.1"></label>
+    <label>A banner you already have costs (banners) <input id="exc" type="number" value="0.5" min="0" max="1" step="0.1"></label>
+    <div class="msg">Banners of the pasted CSV's network. Below 1 the networks keep them where they can; one variant in three starts from the current network. 1 = no preference.</div>
     <label>Banner limit <input id="cap" type="number" value="285" min="20" max="285"></label>
     <div class="msg">Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search time, which keeps lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
     </details>
@@ -148,23 +150,23 @@
       <div class="sw" style="background:#2ecc71;border:2px solid #fff"></div><div>Banner you already have there</div>
       <div class="sw" style="background:rgba(245,197,66,.45)"></div><div>Your territory</div>
       <div class="sw" style="background:#fff;border:2px solid #111"></div><div>Captured resource node (white outline)</div>
-      <div class="sw" style="background:#9b59b6"></div><div>Outpost reached by the network</div>
+      <div class="sw" style="background:linear-gradient(90deg,#a04000 20%,#9a7d0a 20% 40%,#1a5276 40% 60%,#880e4f 60% 80%,#117a65 80%)"></div><div>Outposts by kind, as in KSMapper; the ones reached filled and outlined</div>
       <div class="sw" style="background:#27ae60;border:2px solid #fff"></div><div>Forced outpost</div>
       <div class="sw" style="background:#555;border:2px solid #ff3b30"></div><div>Excluded outpost</div>
       <div class="sw" style="background:rgba(231,76,60,.45)"></div><div>Enemy territory (banner 7x7, HQ 15x15)</div>
       <div class="sw" style="background:#7f8c8d;border:1px solid #2c3e50"></div><div>Current network (from the CSV)</div>
-      <div class="sw" style="background:linear-gradient(90deg,#d6b43c 25%,#46823c 25% 50%,#969696 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
-      <div class="sw" style="background:rgb(128,116,100)"></div><div>Mountain</div>
-      <div class="sw" style="background:rgb(92,150,210)"></div><div>Lake</div>
-      <div class="sw" style="background:#e2e7d2;border:1px solid #888"></div><div>Badlands</div>
-      <div class="sw" style="background:#c9dcb9"></div><div>Plains</div>
-      <div class="sw" style="background:#a9c79c"></div><div>Fertile Land</div>
+      <div class="sw" style="background:linear-gradient(90deg,#deba46 25%,#346e30 25% 50%,#cccccc 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
+      <div class="sw" style="background:rgb(112,102,90)"></div><div>Mountain</div>
+      <div class="sw" style="background:rgb(96,132,170)"></div><div>Lake</div>
+      <div class="sw" style="background:rgb(181,182,156)"></div><div>Badlands</div>
+      <div class="sw" style="background:rgb(158,174,134)"></div><div>Plains</div>
+      <div class="sw" style="background:rgb(134,160,114)"></div><div>Fertile Land</div>
     </div></details>
   </div>
   <div id="mapwrap">
     <canvas id="map"></canvas>
     <div id="modebadge"></div>
-    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="fit" title="Fit the network">Fit</button></div>
+    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="theme" title="Dark or light map">Dark</button><button id="fit" title="Fit the network">Fit</button></div>
     <div id="hover"></div>
   </div>
 </div>

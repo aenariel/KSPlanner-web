@@ -56,7 +56,7 @@
 <div id="app">
   <div id="side">
     <h1>Hive optimiser</h1>
-    <div class="msg" id="version">Version 2026.11.21.5</div>
+    <div class="msg" id="version">Version 2026.11.21.8</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <h2>Central point</h2>
@@ -139,20 +139,19 @@
       <div class="sw" style="background:#85c1e9;border:2px solid #1b4f72"></div><div>Extra city instead of a hive filler (any march time)</div>
       <div class="sw" style="background:linear-gradient(135deg,#111 35%,#3498db 35%)"></div><div>Where the city's banner goes if it is empty: a corner of the city, or a small square on the free tile beside it (red: the city needs two)</div>
       <div class="sw" style="background:rgba(255,0,128,.25)"></div><div>Fence 1 territory (then violet, teal, brown)</div>
-      <div class="sw" style="background:rgb(128,116,100)"></div><div>Mountain</div>
-      <div class="sw" style="background:repeating-linear-gradient(45deg,#968c96 0 2px,#cec8ce 2px 6px)"></div><div>Other blocked ground</div>
-      <div class="sw" style="background:rgb(92,150,210)"></div><div>Lake</div>
-      <div class="sw" style="background:linear-gradient(90deg,#d6b43c 25%,#46823c 25% 50%,#969696 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
-      <div class="sw" style="background:#922b21"></div><div>Structure (no-build zone outlined)</div>
-      <div class="sw" style="background:#e2e7d2;border:1px solid #888"></div><div>Badlands (HQ allowed)</div>
-      <div class="sw" style="background:#c9dcb9"></div><div>Plains (HQ allowed)</div>
-      <div class="sw" style="background:#a9c79c"></div><div>Fertile (no HQ)</div>
-      <div class="sw" style="background:#d2b48c"></div><div>Ruins (no alliance buildings)</div>
+      <div class="sw" style="background:rgb(112,102,90)"></div><div>Mountain</div>
+      <div class="sw" style="background:rgb(96,132,170)"></div><div>Lake</div>
+      <div class="sw" style="background:linear-gradient(90deg,#deba46 25%,#346e30 25% 50%,#cccccc 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
+      <div class="sw" style="background:linear-gradient(90deg,#a04000 20%,#9a7d0a 20% 40%,#1a5276 40% 60%,#880e4f 60% 80%,#117a65 80%)"></div><div>Structures by kind, as in KSMapper (no-build zone outlined)</div>
+      <div class="sw" style="background:rgb(181,182,156)"></div><div>Badlands (HQ allowed)</div>
+      <div class="sw" style="background:rgb(158,174,134)"></div><div>Plains (HQ allowed)</div>
+      <div class="sw" style="background:rgb(134,160,114)"></div><div>Fertile (no HQ)</div>
+      <div class="sw" style="background:rgb(172,152,124)"></div><div>Ruins (no alliance buildings)</div>
     </div></details>
   </div>
   <div id="mapwrap">
     <canvas id="map"></canvas>
-    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="lock" title="Lock: clicks on the map no longer move the central point">Lock</button></div>
+    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="theme" title="Dark or light map">Dark</button><button id="lock" title="Lock: clicks on the map no longer move the central point">Lock</button></div>
     <div id="hover"></div>
   </div>
 </div>

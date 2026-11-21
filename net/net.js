@@ -157,6 +157,9 @@
     const G = goalsOf(P, opts);
     const st = {
       world, P, hx, hy, goals: G.goals, warnings: G.warnings,
+      // banners the alliance already has: cheaper to keep (opts.existingCost, in banners)
+      existing: new Set((opts.existing || []).map(([x, y]) => y * MAP + x)),
+      exCost: opts.existingCost != null ? opts.existingCost : 1,
       cov: new Uint16Array(MAP * MAP),       // how many squares (HQ + banners) cover each tile
       occ: new Uint8Array(MAP * MAP),        // HQ and banner tiles
       bid: new Int32Array(MAP * MAP).fill(-1),
@@ -323,7 +326,7 @@
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, 1, l2);
         for (const e of l2) g += e >= 0 ? val(st.P.nodes[e]) : 0;
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, -1, null);
-        g += rand() * 1e-3;
+        g += (1 - bCost(st, qx, qy)) + rand() * 1e-3;
         if (g > bestG) { bestG = g; best = [qx, qy]; }
       }
       if (!best) break;
@@ -445,7 +448,7 @@
       let best = null, bestG = -1e9;
       for (const p of sample(pick.s.spots, opts.pathSamples || 8, rand)) {
         const path = pathTo(st, F, p[0], p[1], val, rand);
-        const g = trialGain(st, path, val) + rand() * 1e-3;
+        const g = trialGain(st, path, val) + (path.length - pathCost(st, path)) + rand() * 1e-3;
         if (g > bestG) { bestG = g; best = path; }
       }
       for (const [x, y] of best) addBanner(st, x, y, null);
@@ -478,7 +481,7 @@
           const path = pathTo(st, F, p[0], p[1], val, rand);
           if (st.banners.length + path.length > maxBanners) continue;
           const g = trialGain(st, path, val);
-          const r = g / path.length + rand() * 1e-4;
+          const r = g / pathCost(st, path) + rand() * 1e-4;
           if (r > bestR) { bestR = r; best = path; }
         }
       }
@@ -570,9 +573,15 @@
     return { adj, art, reach, need, keeps };
   }
 
+  // what a banner on (x, y) costs: 1, or less where the alliance already has one
+  function bCost(st, x, y) { return st.existing.has(y * MAP + x) ? st.exCost : 1; }
+  function pathCost(st, path) { let c = 0; for (const [x, y] of path) c += bCost(st, x, y); return c; }
+
   function costOf(st, A, opts) {
     const empty = A.need.filter((l) => !l.length).length;
-    return st.banners.length + (opts.emptyWeight != null ? opts.emptyWeight : 0.5) * empty;
+    let c = 0;
+    for (const [x, y] of st.banners) c += bCost(st, x, y);
+    return c + (opts.emptyWeight != null ? opts.emptyWeight : 0.5) * empty;
   }
 
   // ---------------------------------------------------------------- pass 2: prune
@@ -590,6 +599,7 @@
         let key = 0;
         for (let t = 0; t < 4; t++) if (lost[t]) key += lost[t] / Math.max(1, st.count[t] - T[t] + 1);
         key += A.adj[i].length * 1e-3;
+        key += (1 - bCost(st, st.banners[i][0], st.banners[i][1])) * 2;   // a banner already there goes last
         if (key < bestKey) { bestKey = key; best = i; }
       }
       if (best < 0) return;
@@ -724,6 +734,7 @@
     for (const nd of st.P.nodes) if (st.full[nd.i]) captured.push([nd.x, nd.y, nd.t]);
     return {
       goals, captured, warnings: st.warnings,
+      kept: st.banners.filter(([x, y]) => st.existing.has(y * MAP + x)).length,
       banners: st.banners.length,
       empty: empty.filter(Boolean).length,
       cost: costOf(st, c.A, opts),
@@ -741,14 +752,33 @@
   }
 
   // ---------------------------------------------------------------- solve
-  /* One variant end to end: even ones connect the outposts first, odd ones grow resources around
-     the HQ first; from the third on, a seeded noise varies which outpost of a kind is taken. */
+  /* The current network's banners that chain to the HQ, in chain order (others are left out). */
+  function seedExisting(st, banners, cap) {
+    let left = banners.filter(([x, y]) => placeable(st, y * MAP + x));
+    for (let grew = true; grew && left.length && st.banners.length < cap;) {
+      grew = false;
+      const rest = [];
+      for (const [x, y] of left) {
+        if (st.banners.length >= cap) break;
+        if (linksHQ(st, x, y) || st.banners.some(([bx, by]) => linkB(st, bx, by, x, y))) { addBanner(st, x, y, null); grew = true; }
+        else rest.push([x, y]);
+      }
+      left = rest;
+    }
+  }
+
+  /* One variant end to end, in turn: connect the outposts first; grow resources around the HQ
+     first; and, with a current network (opts.existing), start from its banners that chain to the
+     HQ. From the third variant on, seeded noise varies which outpost of a kind is taken. */
   function runVariant(world, hx, hy, opts, v) {
     const cap = opts.maxBanners || 285;
     const rand = rng((opts.seed || 1) * 7919 + v);
     const st = makeState(world, hx, hy, opts);
-    const mode = v % 2;   // 0: outposts first, 1: resources around the HQ first
+    // 0: outposts first, 1: resources around the HQ first, 2 (with a current network): start from it
+    const hasEx = st.existing.size > 0;
+    const mode = hasEx ? v % 3 : v % 2;
     if (mode === 1) growResources(st, opts, rand, cap);
+    if (mode === 2) seedExisting(st, opts.existing, cap);
     const ok = connectOutposts(st, opts, rand, v < 2 ? 0 : 1.5);
     growResources(st, opts, rand, cap);
     const pass1 = summary(st, opts);
@@ -759,7 +789,7 @@
     const order = buildOrder(st);
     s.design = order.map((i) => st.banners[i].slice());
     s.emptyFlags = order.map((i) => s.emptyFlags[i]);
-    s.variant = v; s.mode = mode ? "resources first" : "outposts first";
+    s.variant = v; s.mode = ["outposts first", "resources first", "from the current network"][mode];
     s.pass1 = { banners: pass1.banners, nodes: pass1.nodes };
     s.pass2 = { banners: pass2.banners, empty: pass2.empty, cost: pass2.cost };
     s.reachedAll = ok;

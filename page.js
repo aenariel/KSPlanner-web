@@ -11,7 +11,6 @@ const view = { cu: 600, cv: 600, s: 0.6 };   // centre in game coordinates, CSS 
 const cv = $("map"), g = cv.getContext("2d");
 const C45 = Math.SQRT1_2;
 
-const TERRAIN_COL = { 0: [226, 231, 210], 1: [128, 116, 100], 2: [92, 150, 210], 3: [92, 150, 210], 4: [120, 160, 100], 5: [180, 167, 214], 6: [194, 123, 160], 7: [200, 200, 200], 8: [213, 166, 189], 9: [40, 40, 40] };
 // game zones, outermost first (game coordinates, inclusive)
 const ZONES = [
   { name: "Plains", r: [300, 300, 899, 899], fill: "rgba(70,150,60,0.16)", line: "rgba(40,110,40,0.7)" },
@@ -20,7 +19,81 @@ const ZONES = [
   { name: "Forbidden", r: [586, 586, 613, 613], fill: "rgba(150,30,40,0.35)", line: "rgba(120,20,30,0.9)" },
 ];
 const zoneAt = (x, y) => { let z = "Badlands"; for (const q of ZONES) if (x >= q.r[0] && x <= q.r[2] && y >= q.r[1] && y <= q.r[3]) z = q.name; return z; };
-const NODE_COL = { bread: [214, 180, 60], wood: [70, 130, 60], stone: [150, 150, 150], iron: [150, 80, 50] };
+// map themes: mid-tone ground, or a dark one (KSMapper-like); the choice is kept in this browser
+const THEMES = {
+  light: {
+    zone: { Badlands: [181, 182, 156], Plains: [158, 174, 134], Fertile: [134, 160, 114], Ruins: [172, 152, 124], Forbidden: [160, 128, 128] },
+    terrain: { 1: [112, 102, 90], 2: [96, 132, 170], 3: [96, 132, 170], 4: [110, 140, 96] },
+    node: { bread: [222, 186, 70], wood: [52, 110, 48], stone: [204, 204, 204], iron: [150, 80, 50] },
+    zoneLine: { Plains: "rgba(25,55,20,.75)", Fertile: "rgba(15,45,12,.85)", Ruins: "rgba(90,55,20,.85)", Forbidden: "rgba(110,20,30,.9)" },
+    text: "rgba(22,26,30,.92)", soft: "rgba(20,25,30,.85)", grid: "rgba(0,0,0,.12)", void: "#0b0d10",
+  },
+  dark: {
+    zone: { Badlands: [44, 56, 40], Plains: [36, 64, 34], Fertile: [26, 58, 28], Ruins: [72, 52, 32], Forbidden: [74, 26, 34] },
+    terrain: { 1: [86, 78, 70], 2: [38, 70, 108], 3: [38, 70, 108], 4: [40, 72, 40] },
+    node: { bread: [206, 168, 56], wood: [96, 168, 84], stone: [168, 168, 168], iron: [176, 98, 62] },
+    zoneLine: { Plains: "rgba(170,215,150,.55)", Fertile: "rgba(150,220,140,.6)", Ruins: "rgba(220,170,110,.7)", Forbidden: "rgba(230,110,120,.8)" },
+    text: "rgba(222,226,230,.9)", soft: "rgba(214,220,226,.85)", grid: "rgba(255,255,255,.07)", void: "#07080a",
+  },
+};
+// structures coloured by family, as in KSMapper (both levels of an outpost share the colour)
+const STRUCT_COL = { "Builder's Guild": "#a04000", Armory: "#9a7d0a", "Scholar's": "#1a5276", Arsenal: "#880e4f", Forager: "#1e8449", Harvest: "#117a65", "Drill Camp": "#5d6d7e", Frontier: "#6e2c0c", Fortress: "#922b21", Sanctuary: "#6c3483" };
+const structCol = (name) => STRUCT_COL[String(name || "").replace(/ \d+$/, "")] || "#922b21";
+let theme = (() => { try { const t = localStorage.getItem("ksplanner-map-theme"); if (t === "light" || t === "dark") return t; } catch (e) {} return window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; })();
+const TH = () => THEMES[theme];
+/* The fixed map (ground, lakes, mountains, nodes, structures) painted once per theme. */
+function paintBase(sm) {
+  const T = TH();
+  base = base || document.createElement("canvas");
+  base.width = M; base.height = M;
+  const bg = base.getContext("2d");
+  const img = bg.createImageData(M, M);
+  for (let y = 0; y < M; y++) for (let x = 0; x < M; x++) {
+    const t = world.terrain[y * M + x];
+    const z = zoneAt(x, y);
+    // 5 and up are structures' footprints and no-build zones (drawn with their own tint and outline)
+    const c0 = t === 0 || t >= 5 ? T.zone[z] : (T.terrain[t] || T.zone[z]);
+    let c = c0;
+    // the castle (Ruins and the centre) is empty ground in the game: the decor and rocks in the data are left out
+    if (z === "Ruins" || z === "Forbidden") c = T.zone[z];
+    const o = (y * M + x) * 4;
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+  }
+  for (const n of sm.nodes) {
+    const c = T.node[n.type] || [90, 60, 40];
+    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+      const o = ((n.y + dy) * M + n.x + dx) * 4;
+      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2];
+    }
+  }
+  bg.putImageData(img, 0, 0);
+  for (const s of sm.structures) {
+    const col = structCol(s.name);
+    bg.fillStyle = col;
+    bg.fillRect(s.x, s.y, s.size, s.size);
+    const fx = Math.round(s.x + s.size / 2 - s.forbidden_zone / 2), fy = Math.round(s.y + s.size / 2 - s.forbidden_zone / 2);
+    bg.fillStyle = col + (s.city_exempt ? "18" : "30");
+    bg.fillRect(fx, fy, s.forbidden_zone, s.forbidden_zone);
+  }
+}
+/* Zone borders and no-build zone outlines: thin lines on the tile edges, drawn each frame (world mode),
+   so no row of tiles changes colour and it is clear which zone a tile is in. */
+function drawMapLines() {
+  const T = TH();
+  for (const z of ZONES) rect(z.r[0], z.r[1], z.r[2] - z.r[0] + 1, z.r[3] - z.r[1] + 1, null, T.zoneLine[z.name], 1.5);
+  if (!smap) return;
+  for (const s of smap.structures) {
+    const fx = Math.round(s.x + s.size / 2 - s.forbidden_zone / 2), fy = Math.round(s.y + s.size / 2 - s.forbidden_zone / 2);
+    rect(fx, fy, s.forbidden_zone, s.forbidden_zone, null, structCol(s.name) + (s.city_exempt ? "90" : "e0"), 1.2);
+  }
+}
+function setTheme(t) {
+  theme = t;
+  try { localStorage.setItem("ksplanner-map-theme", t); } catch (e) {}
+  const b = document.getElementById("theme");
+  if (b) b.textContent = t === "dark" ? "Light" : "Dark";
+  if (world && smap) { paintBase(smap); draw(); }
+}
 
 async function init() {
   try {
@@ -29,38 +102,7 @@ async function init() {
     const sm = await res.json();
     smap = sm;
     world = Hive.buildWorld(sm);
-    base = document.createElement("canvas");
-    base.width = M; base.height = M;
-    const bg = base.getContext("2d");
-    const img = bg.createImageData(M, M);
-    // pixel (x, y) = tile (x, y): the view transform does the rotation. Clear ground is tinted by
-    // resource zone (HQ only in Plains / Badlands); lakes and mountains keep their own colour.
-    const ZONE_TINT = { Badlands: [230, 233, 216], Plains: [210, 227, 190], Fertile: [186, 214, 166], Ruins: [228, 207, 174], Forbidden: [224, 190, 194] };
-    for (let y = 0; y < M; y++) for (let x = 0; x < M; x++) {
-      const t = world.terrain[y * M + x];
-      let c = t === 0 ? ZONE_TINT[zoneAt(x, y)] : (TERRAIN_COL[t] || [255, 0, 255]);
-      // other ground nothing can be built on: hatched grey, so it never reads as a zone shade
-      if (t >= 5) c = (x + y) % 4 === 0 ? [176, 168, 178] : [212, 207, 213];
-      const o = (y * M + x) * 4;
-      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
-    }
-    for (const n of sm.nodes) {
-      const c = NODE_COL[n.type] || [90, 60, 40];
-      for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
-        const o = ((n.y + dy) * M + n.x + dx) * 4;
-        img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2];
-      }
-    }
-    bg.putImageData(img, 0, 0);
-    for (const z of ZONES) { bg.strokeStyle = z.line; bg.lineWidth = 1; bg.strokeRect(z.r[0] + 0.5, z.r[1] + 0.5, z.r[2] - z.r[0], z.r[3] - z.r[1]); }
-    for (const s of sm.structures) {
-      bg.fillStyle = "#922b21";
-      bg.fillRect(s.x, s.y, s.size, s.size);
-      const fx = Math.round(s.x + s.size / 2 - s.forbidden_zone / 2), fy = Math.round(s.y + s.size / 2 - s.forbidden_zone / 2);
-      bg.strokeStyle = s.city_exempt ? "rgba(146,43,33,.35)" : "rgba(146,43,33,.8)";
-      bg.lineWidth = 1;
-      bg.strokeRect(fx + 0.5, fy + 0.5, s.forbidden_zone - 1, s.forbidden_zone - 1);
-    }
+    paintBase(sm);
     // labels: structures, nodes, lakes and mountains (one per connected patch)
     staticLabels = [];
     for (const s of sm.structures) staticLabels.push({ u: s.x + s.size / 2, v: s.y + s.size / 2, text: s.name || s.category, sub: s.x + "," + s.y, w: s.size, min: 1.5, big: true });
@@ -82,7 +124,7 @@ async function init() {
           if (water ? (tk === 2 || tk === 3) : tk === 1) { seen[k] = 1; stack.push(k); }
         }
       }
-      if (n >= 6) staticLabels.push({ u: sx / n + 0.5, v: sy / n + 0.5, text: water ? "Lake" : "Mountain", min: 3, terrain: true });
+      if (n >= 6 && !["Ruins", "Forbidden"].includes(zoneAt(sx / n, sy / n))) staticLabels.push({ u: sx / n + 0.5, v: sy / n + 0.5, text: water ? "Lake" : "Mountain", min: 3, terrain: true });
     }
     $("loadmsg").textContent = "";
     fenceReady();
@@ -112,9 +154,9 @@ function toWorld(px, py) {   // CSS px -> game coords
 function tileAt(px, py) { const [u, v] = toWorld(px, py); return [Math.floor(u), Math.floor(v)]; }
 function worldMode() { const m = mat(); g.setTransform(m.a, m.b, m.c, m.d, m.e, m.f); }
 function screenMode() { g.setTransform(1, 0, 0, 1, 0, 0); }
-function rect(x, y, w, h, fill, stroke) {
+function rect(x, y, w, h, fill, stroke, lw) {
   if (fill) { g.fillStyle = fill; g.fillRect(x, y, w, h); }
-  if (stroke) { g.strokeStyle = stroke; g.lineWidth = 1.2 / (view.s * dpr()) * dpr(); g.strokeRect(x, y, w, h); }
+  if (stroke) { g.strokeStyle = stroke; g.lineWidth = (lw || 1.2) / view.s; g.strokeRect(x, y, w, h); }
 }
 function resize() {
   const r = cv.getBoundingClientRect();
@@ -125,11 +167,12 @@ function resize() {
 function draw() {
   if (!cv.width) return;
   screenMode();
-  g.fillStyle = "#0b0d10"; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = TH().void; g.fillRect(0, 0, cv.width, cv.height);
   if (!base) return;
   worldMode();
   g.imageSmoothingEnabled = false;
   g.drawImage(base, 0, 0);
+  drawMapLines();
   const px = view.s * dpr();   // device px per tile
   const d = fplan && fplan.src === "csv" ? null : designs[sel];
   if (fplan) drawFenceBase();
@@ -153,7 +196,7 @@ function draw() {
     const corners = [[0, 0], [cv.width / dpr(), 0], [0, cv.height / dpr()], [cv.width / dpr(), cv.height / dpr()]].map(([a, b]) => toWorld(a, b));
     const u0 = Math.floor(Math.min(...corners.map((c) => c[0]))), u1 = Math.ceil(Math.max(...corners.map((c) => c[0])));
     const v0 = Math.floor(Math.min(...corners.map((c) => c[1]))), v1 = Math.ceil(Math.max(...corners.map((c) => c[1])));
-    g.strokeStyle = "rgba(0,0,0,.12)"; g.lineWidth = 1 / px;
+    g.strokeStyle = TH().grid; g.lineWidth = 1 / px;
     g.beginPath();
     for (let u = u0; u <= u1; u++) { g.moveTo(u, v0); g.lineTo(u, v1); }
     for (let v = v0; v <= v1; v++) { g.moveTo(u0, v); g.lineTo(u1, v); }
@@ -187,7 +230,7 @@ function coordAt(x, y, px) {
   const [a, b] = toScreen(x, y);
   g.font = Math.round(Math.min(11 * dpr(), Math.max(8 * dpr(), px * 0.32))) + "px system-ui";
   g.textAlign = "center"; g.textBaseline = "top";
-  g.fillStyle = "rgba(55,60,70,.9)";
+  g.fillStyle = TH().text;
   g.fillText(x + "," + y, a, b + 1 * dpr());
 }
 function nameAt(u, v, t, size, onColour) {
@@ -195,7 +238,7 @@ function nameAt(u, v, t, size, onColour) {
   g.font = "600 " + Math.round(size) + "px system-ui";
   g.textAlign = "center"; g.textBaseline = "middle";
   if (onColour) { g.shadowColor = "rgba(0,0,0,.6)"; g.shadowBlur = 3 * dpr(); g.fillStyle = "#fff"; }
-  else g.fillStyle = "rgba(40,50,65,.8)";
+  else g.fillStyle = TH().soft;
   g.fillText(t, a, b);
   g.shadowBlur = 0; g.shadowColor = "transparent";
 }
@@ -494,6 +537,8 @@ function zoomAt(px, py, f) {
 function setLock(on) { locked = on; $("lock").classList.toggle("on", locked); $("lock").textContent = locked ? "Locked" : "Lock"; }
 $("lock").onclick = () => { setLock(!locked); saveSettings(); };
 $("zin").onclick = () => { const r = cv.getBoundingClientRect(); zoomAt(r.width / 2, r.height / 2, 1.5); };
+$("theme").onclick = () => setTheme(theme === "dark" ? "light" : "dark");
+$("theme").textContent = theme === "dark" ? "Light" : "Dark";
 $("zout").onclick = () => { const r = cv.getBoundingClientRect(); zoomAt(r.width / 2, r.height / 2, 1 / 1.5); };
 $("fixhq").onchange = () => { $("radius").disabled = $("fixhq").checked; };
 $("radius").disabled = $("fixhq").checked;
