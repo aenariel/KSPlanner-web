@@ -973,7 +973,7 @@
      for K banners around the HQ square) is rotated to each side of the HQ; clean pairs are kept,
      the best per banner budget go to an exact banner cover. Results sorted by average distance. */
   async function solve(world, cx, cy, opts, onProgress, highs) {
-    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 0, bannerCost: 0.1, centreTie: 0.2, symCost: 1 }, opts || {});
+    opts = Object.assign({ minCities: 120, designs: 8, radius: 15, perBudget: 3, maxHits: 8, refitNodes: 1000, refitTime: 120, refitMax: 0, bannerCost: 0.1, centreTie: 0.2, symCost: 1, extraSecs: 31 }, opts || {});
     // nearer the map's centre is better (Fertile Land gives cities a big bonus), but only as a
     // tie-break: the traps' mean distance to it (Chebyshev, like the zones)
     const centreDist = (traps) => traps.reduce((a, t) => a + Math.max(Math.abs(t[0] + 1.5 - 600), Math.abs(t[1] + 1.5 - 600)), 0) / traps.length;
@@ -1466,10 +1466,53 @@
           }
         }
       }
+      // loose cities: with every other city in place, and the fence taking all free ground open to the
+      // outside, can a city still stand 1 tile off its slot (sideways or diagonally) on friendly free
+      // ground? Next to the HQ, node or statues it can't always be helped (3x3 and 2x2 don't mesh):
+      // counted apart. Designs with loose cities elsewhere come after the others.
+      const countLoose = () => {
+        let loose = 0, looseFar = 0;
+        const solid = (j) => used[j] || ctx.city[j] || ctx.ally[j];
+        const outside = new Uint8Array(S * S), st = [];
+        for (let i = 0; i < S; i++) for (const j of [i, (S - 1) * S + i, i * S, i * S + S - 1]) if (!solid(j) && !outside[j]) { outside[j] = 1; st.push(j); }
+        while (st.length) {
+          const j = st.pop(), x = j % S, y = (j / S) | 0;
+          for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= S || yy >= S) continue;
+            const k = yy * S + xx;
+            if (!outside[k] && !solid(k)) { outside[k] = 1; st.push(k); }
+          }
+        }
+        const hole = (x, y) => { const j = y * S + x; return x >= 0 && y >= 0 && x < S && y < S && !solid(j) && !outside[j] && terr.has(j); };
+        const fixedRects = [[R, R, R + 2, R + 2]].concat(extras.map((e) => [e.x, e.y, e.x + e.w - 1, e.y + e.w - 1]));
+        // a shift counts as next to the HQ / node / statues when the gap it slides into touches one
+        // (corners count): that gap is the 3x3 / 2x2 mismatch
+        const nearFixed = (x, y) => fixedRects.some((r) => touches(r, [x, y, x, y]));
+        for (const c of cities) {
+          let can = false, far = false;
+          for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+            let ok = true, near = false;
+            for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+              const x = c.x + dx + i, y = c.y + dy + j;
+              if (x >= c.x && x <= c.x + 1 && y >= c.y && y <= c.y + 1) continue;   // its own tile
+              if (!hole(x, y)) { ok = false; break; }
+              if (nearFixed(x, y)) near = true;
+            }
+            if (!ok) continue;
+            can = true;
+            if (!near) far = true;
+          }
+          if (can) loose++;
+          if (far) looseFar++;
+        }
+        return { loose, looseFar };
+      };
       // the design's mirror axis: a symmetric pair's, or the one its traps happen to share
       const [t0, t1] = traps;
       const axis = f.mir || (t0[1] === t1[1] && t0[0] + t1[0] === 2 * R ? "x" : t0[0] === t1[0] && t0[1] + t1[1] === 2 * R ? "y" : null);
-      // extra slots: every free 2x2 left inside the territory within 30 s of a trap, nearest first;
+      // extra slots: every free 2x2 left inside the territory within extraSecs (31 s) of a trap, nearest first
+      // (the fence takes back the ones it needs);
       // farther ones, nearest first, only while the cities wanted (minCities) are not reached. With
       // a mirror axis, each slot taken brings its image along when that is free too.
       {
@@ -1483,16 +1526,28 @@
           for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) used[(c.y + j) * S + c.x + i] = 1;
           cities.push({ x: c.x, y: c.y, d: c.d, k: c.k, extra: true });
         };
+        const undo = () => {
+          const c = cities.pop();
+          for (const [i, j] of [[0, 0], [1, 0], [0, 1], [1, 1]]) used[(c.y + j) * S + c.x + i] = 0;
+        };
+        // a slot (with its image) that would leave a city loose away from the HQ / node is skipped:
+        // extra slots must hold like the rest
+        let farNow = countLoose().looseFar;
         for (const far of [false, true]) for (const c of cand) {
           const secs = marchSecs(c.d[c.k]);
-          if (far ? secs <= 30 || cities.length >= minC : secs > 30) continue;
+          if (far ? secs <= opts.extraSecs || cities.length >= minC : secs > opts.extraSecs) continue;
           if (!free4(c.x, c.y)) continue;
           take(c);
-          if (!axis) continue;
-          const [mx, my] = axis === "x" ? [2 * R + 1 - c.x, c.y] : [c.x, 2 * R + 1 - c.y];
-          if (free4(mx, my)) take(slot(mx, my));
+          let n = 1;
+          if (axis) {
+            const [mx, my] = axis === "x" ? [2 * R + 1 - c.x, c.y] : [c.x, 2 * R + 1 - c.y];
+            if (free4(mx, my)) { take(slot(mx, my)); n++; }
+          }
+          const f2 = countLoose().looseFar;
+          if (f2 > farNow) { while (n--) undo(); } else farNow = f2;
         }
       }
+      const { loose, looseFar } = countLoose();
       const coreCities = cities.filter((c) => !c.extra);
       const rows = [0, 1].map((k) => rowAverages(coreCities.filter((c) => c.k === k).map((c) => c.d[k])));
       const coreD = coreCities.map((c) => c.d[c.k]);
@@ -1536,7 +1591,7 @@
           secs: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k && !c.extra).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v) }; }),
           secsAll: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v), n: v.length }; }),
           hqShift: [ctx.ox + R - cx, ctx.oy + R - cy],
-          sym, symAxis, symPair: !!f.mir, short: Math.max(0, minC - cities.length),
+          sym, symAxis, symPair: !!f.mir, short: Math.max(0, minC - cities.length), loose, looseFar,
         },
       };
       const gd = toGameDesign(d);
@@ -1552,7 +1607,8 @@
     // a design with room for every statue and the node comes first, whatever its score; designs
     // within centreTie s of the best left: traps nearer the map centre first
     // then the ones with all the cities wanted
-    const grp = (d) => 2 * d.missing.length + (d.stats.short ? 1 : 0);
+    // then the ones that hold every city (no loose city away from the HQ / node)
+    const grp = (d) => 4 * d.missing.length + (d.stats.short ? 2 : 0) + (d.stats.looseFar ? 1 : 0);
     const order = (a, b) => grp(a) - grp(b) || score(a) - score(b) || a.k - b.k || a.stats.coreAvg - b.stats.coreAvg;
     const rank = (list) => {
       const out = [];

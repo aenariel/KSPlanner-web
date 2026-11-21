@@ -521,7 +521,7 @@ $("run").onclick = () => {
   designs = []; sel = -1; $("results").hidden = true;
   $("run").disabled = true; $("runmsg").textContent = "Starting…"; $("prog").style.width = "0";
   const opts = {
-    minCities: +$("minCities").value || 120, radius: Math.max(0, +$("radius").value || 0), bannerCost: Math.max(0, +$("bannerCost").value || 0), symCost: Math.max(0, +($("symCost").value || 0)), centreTie: Math.max(0, +$("centreTie").value || 0),
+    minCities: +$("minCities").value || 120, radius: Math.max(0, +$("radius").value || 0), bannerCost: Math.max(0, +$("bannerCost").value || 0), symCost: Math.max(0, +($("symCost").value || 0)), extraSecs: Math.max(1, +$("extraSecs").value || 31), centreTie: Math.max(0, +$("centreTie").value || 0),
     designs: +$("ndesigns").value || 4, tag: $("tag").value || "HIVE",
   };
   if ($("fixhq").checked) opts.radius = 0;
@@ -559,7 +559,7 @@ function listDesigns() {
     const b = document.createElement("button");
     b.className = "design";
     const s = d.stats;
-    b.textContent = s.secs.map((t) => t.avg.toFixed(1) + "s / max " + t.max + "s").join(" | ") + " · " + s.perTrap.join("+") + (s.extra ? " +" + s.extra + " extra" : "") + " cities · " + d.k + " banners · " + Math.round(s.sym * 100) + "% sym · HQ " + d.hq.join(",");
+    b.textContent = s.secs.map((t) => t.avg.toFixed(1) + "s / max " + t.max + "s").join(" | ") + " · " + s.perTrap.join("+") + (s.extra ? " +" + s.extra + " extra" : "") + " cities · " + d.k + " banners · " + Math.round(s.sym * 100) + "% sym" + (s.looseFar ? " · " + s.looseFar + " loose" : "") + " · HQ " + d.hq.join(",");
     b.onclick = () => pick(i);
     box.appendChild(b);
   });
@@ -577,6 +577,7 @@ function pick(i) {
   $("stats").innerHTML = [
     ["Core slots BT1 / BT2", s.perTrap.join(" / ")],
     ["Extra slots (free territory) BT1 / BT2", s.extraPerTrap.join(" / ")],
+    ["Loose cities (can stand 1 tile off with the rest in place)", (s.loose || 0) + (s.loose ? " (" + (s.looseFar || 0) + " away from the HQ / node)" : "")],
     ["Total cities", s.total + (s.short ? " (" + s.short + " short of the cities wanted)" : "")],
     ["Symmetry", Math.round(s.sym * 100) + "%" + (s.symAxis ? " (mirror in the HQ's middle " + (s.symAxis === "x" ? "column" : "row") + ")" : "") + (s.symPair ? ", mirrored clusters" : "")],
     ["Core march time BT1 avg / max", s.secs[0].avg.toFixed(1) + " s / " + s.secs[0].max + " s"],

@@ -17,19 +17,38 @@ async function load() {
 self.onmessage = async (e) => {
   if (e.data.kind === "fence") return fence(e.data);
   if (e.data.kind === "eval-init" || e.data.kind === "eval") return evalRun(e.data);
+  if (e.data.kind === "hscan") return hscanRun(e.data);
   const { hx, hy, opts } = e.data;
+  let pool = null;
   try {
     await load();
     let last = 0;
-    const designs = await Hive.solve(world, hx, hy, Object.assign({ library: self.ROWLIB }, opts), (p) => {
+    // the HQ scan spread over helper workers (same designs as one worker, only faster)
+    pool = await makePool(null);
+    const scanPool = pool ? (jobs, onJob) => pool.run(jobs.map(([q0, q1]) => ({ kind: "hscan", hx, hy, opts, q0, q1 })), onJob).then((r) => r.map((m) => m.cands)) : null;
+    if (scanPool) scanPool.size = pool.size;
+    const designs = await Hive.solve(world, hx, hy, Object.assign({ library: self.ROWLIB, scanPool }, opts), (p) => {
       const now = Date.now();
       if (p.stage !== "search" || now - last > 150) { last = now; self.postMessage({ type: "progress", p }); }
     }, highs);
     self.postMessage({ type: "done", designs: designs.map((d) => Object.assign(d, { csv: Hive.toCsv(d, opts.tag) })) });
   } catch (err) {
     self.postMessage({ type: "error", message: String((err && err.message) || err) });
+  } finally {
+    if (pool) pool.close();
   }
 };
+
+/* A helper worker's share of the hive's HQ scan: positions q0..q1-1, its best per budget. */
+async function hscanRun(m) {
+  try {
+    await load();
+    const cands = await Hive.solve(world, m.hx, m.hy, Object.assign({ library: self.ROWLIB }, m.opts, { scanRange: [m.q0, m.q1] }), null, highs);
+    self.postMessage({ id: m.id, cands });
+  } catch (err) {
+    self.postMessage({ id: m.id, cands: [], error: String((err && err.message) || err) });
+  }
+}
 
 /* A helper worker of the fence designer's pool: one end-to-end run per message. */
 let evalInput = null;
@@ -65,7 +84,14 @@ async function makePool(input) {
       await Promise.all(pool.map(async (w) => { while (next < list.length) { const i = next++; out[i] = (await call(w, { kind: "eval", opts: list[i] })).plan; } }));
       return out;
     };
-    return { evaluate, size, close: () => pool.forEach((w) => w.terminate()) };
+    // any list of messages, results in list order; a helper's error fails the whole run
+    const run = async (list, onDone) => {
+      const out = new Array(list.length);
+      let next = 0;
+      await Promise.all(pool.map(async (w) => { while (next < list.length) { const i = next++; out[i] = await call(w, list[i]); if (out[i].error) throw new Error(out[i].error); if (onDone) onDone(i); } }));
+      return out;
+    };
+    return { evaluate, run, size, close: () => pool.forEach((w) => w.terminate()) };
   } catch (err) {
     pool.forEach((w) => w.terminate());
     return null;
