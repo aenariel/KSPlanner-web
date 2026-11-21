@@ -992,7 +992,8 @@
       return out;
     };
     if (!highs) throw new Error("The exact solver (HiGHS) is required.");
-    const lib = (opts.library || []).filter((m) => m.cities.length === m.N);
+    // clusters that don't keep row 2 whole (its 16 slots) break the rule that rows 1-2 never move
+    const lib = (opts.library || []).filter((m) => m.cities.length === m.N && (m.r2kept === undefined || m.r2kept >= 16));
     if (!lib.length) throw new Error("No cluster library loaded.");
     // minCities is the number of cities wanted in all: the two clusters hold up to the library's
     // largest pair, extra slots in the free territory make up the rest
@@ -1356,6 +1357,178 @@
     }
     if (!finals.length) throw new Error("No clean layout found. Try another central point or a larger radius.");
 
+    // 3b. polish: a library cluster is shaped on an empty map for its banner budget, and the banner
+    //     cover only serves its slots, so faster free spots just outside the territory go unused. For
+    //     each design, try one more banner (with its mirror image when the design has a mirror axis):
+    //     the slowest cities of a trap (never rows 1-2, its 24 nearest) move to the faster spots it
+    //     brings into territory. Kept when the mean march gain beats `bannerCost` per banner; banners
+    //     the moves leave useless come down. Repeated while it pays. The polished design is added
+    //     next to the original, so the ranking (loose cities, symmetry, score) picks.
+    //     Only the most promising designs are polished (mean march + banner cost, best `polishTop`).
+    if (opts.polish !== false) {
+      const est = (f) => {
+        const S = f.ctx.S;
+        let sum = 0, n = 0;
+        f.parts.forEach((p) => p.cityA.forEach((i) => { sum += marchSecs(Math.hypot((i % S) + 1 - p.tx - 1.5, ((i / S) | 0) + 1 - p.ty - 1.5)); n++; }));
+        return sum / n + opts.bannerCost * f.banners.length;
+      };
+      const extra = [];
+      for (const f of finals.slice().sort((a, b) => est(a) - est(b)).slice(0, opts.polishTop ?? 12)) { const p = polish(f); if (p) extra.push(p); }
+      finals.push(...extra);
+    }
+    function polish(f) {
+      const { ctx } = f, S = ctx.S, R = ctx.R;
+      const parts = f.parts.map((p) => ({ tx: p.tx, ty: p.ty, cityA: p.cityA.slice() }));
+      let banners = f.banners.slice();
+      const tc = parts.map((p) => [p.tx + 1.5, p.ty + 1.5]);
+      const secsOf = (i, k) => marchSecs(Math.hypot((i % S) + 1 - tc[k][0], ((i / S) | 0) + 1 - tc[k][1]));
+      const near = (i) => { const d = tc.map(([x, y]) => Math.hypot((i % S) + 1 - x, ((i / S) | 0) + 1 - y)); return d[0] <= d[1] ? 0 : 1; };
+      // rows 1-2 stay: each trap's 24 nearest slots
+      const keep = new Set();
+      parts.forEach((p, k) => p.cityA.slice().sort((a, b) => secsOf(a, k) - secsOf(b, k) || a - b).slice(0, 24).forEach((i) => keep.add(i)));
+      const t0 = parts[0], t1 = parts[1];
+      const axis = f.mir || (t0.ty === t1.ty && t0.tx + t1.tx === 2 * R ? "x" : t0.tx === t1.tx && t0.ty + t1.ty === 2 * R ? "y" : null);
+      const mirB = (b) => { const x = b % S, y = (b / S) | 0; return axis === "x" ? y * S + (2 * R + 2 - x) : (2 * R + 2 - y) * S + x; };
+      const nCore = parts[0].cityA.length + parts[1].cityA.length;
+      const terrOf = (bs) => {
+        const t = new Uint8Array(S * S);
+        for (let y = R - 6; y <= R + 8; y++) for (let x = R - 6; x <= R + 8; x++) t[y * S + x] = 1;
+        for (const b of bs) { const bx = b % S, by = (b / S) | 0; for (let y = by - 3; y <= by + 3; y++) for (let x = bx - 3; x <= bx + 3; x++) if (x >= 0 && y >= 0 && x < S && y < S) t[y * S + x] = 1; }
+        return t;
+      };
+      const occOf = () => {
+        const o = new Uint8Array(S * S);
+        for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) o[(R + y) * S + R + x] = 1;
+        for (const p of parts) {
+          for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) o[(p.ty + y) * S + p.tx + x] = 1;
+          for (const i of p.cityA) o[i] = o[i + 1] = o[i + S] = o[i + S + 1] = 1;
+        }
+        for (const b of banners) o[b] = 1;
+        return o;
+      };
+      const covered = (terr, i) => terr[i] && terr[i + 1] && terr[i + S] && terr[i + S + 1];
+      const chained = (bs) => {
+        const rects = [[R - 6, R - 6, R + 8, R + 8]].concat(bs.map((b) => [b % S - 3, ((b / S) | 0) - 3, b % S + 3, ((b / S) | 0) + 3]));
+        const ok = new Uint8Array(rects.length); ok[0] = 1;
+        let ch = true;
+        while (ch) { ch = false; for (let j = 1; j < rects.length; j++) if (!ok[j]) for (let i = 0; i < rects.length; i++) if (ok[i] && touches(rects[i], rects[j])) { ok[j] = 1; ch = true; break; } }
+        return ok.every(Boolean);
+      };
+      let changed = false;
+      for (let round = 0; round < 6; round++) {
+        const terr = terrOf(banners), occ = occOf();
+        const xs = [], ys = [];
+        for (const p of parts) for (const i of p.cityA) { xs.push(i % S); ys.push((i / S) | 0); }
+        const x0 = Math.max(4, Math.min(...xs) - 5), x1 = Math.min(S - 5, Math.max(...xs) + 6), y0 = Math.max(4, Math.min(...ys) - 5), y1 = Math.min(S - 5, Math.max(...ys) + 6);
+        let best = null;
+        const tried = new Set();
+        for (let by = y0; by <= y1; by++) for (let bx = x0; bx <= x1; bx++) {
+          const b = by * S + bx;
+          if (occ[b] || ctx.ally[b] || tried.has(b)) continue;
+          let add = [b];
+          if (axis) { const m = mirB(b); if (m !== b) { if (m < 0 || m >= S * S || occ[m] || ctx.ally[m]) continue; add.push(m); } }
+          add.forEach((q) => tried.add(q));
+          const bs = banners.concat(add);
+          const touchesTerr = (q) => { const qx = q % S, qy = (q / S) | 0; for (let y = qy - 4; y <= qy + 4; y++) for (let x = qx - 4; x <= qx + 4; x++) if (x >= 0 && y >= 0 && x < S && y < S && terr[y * S + x]) return true; return false; };
+          if (!add.every(touchesTerr)) continue;
+          const t2 = terrOf(bs), o2 = occ.slice();
+          for (const q of add) o2[q] = 1;
+          // new spots: fully in the new territory, not before (extra slots take those anyway), free ground
+          const spots = [];
+          for (const q of add) {
+            const qx = q % S, qy = (q / S) | 0;
+            for (let y = qy - 4; y <= qy + 3; y++) for (let x = qx - 4; x <= qx + 3; x++) {
+              if (x < 1 || y < 1 || x + 2 >= S || y + 2 >= S) continue;
+              const i = y * S + x;
+              if (!covered(t2, i) || covered(terr, i)) continue;
+              if (o2[i] || o2[i + 1] || o2[i + S] || o2[i + S + 1] || ctx.city[i] || ctx.city[i + 1] || ctx.city[i + S] || ctx.city[i + S + 1]) continue;
+              const k = near(i);
+              spots.push({ i, k, s: secsOf(i, k) });
+            }
+          }
+          if (!spots.length) continue;
+          spots.sort((p, q) => p.s - q.s || p.i - q.i);
+          // the slowest movable cities of each trap, slowest first
+          const slow = parts.map((p, k) => p.cityA.filter((i) => !keep.has(i)).map((i) => ({ i, s: secsOf(i, k) })).sort((p2, q) => q.s - p2.s || q.i - p2.i));
+          const used = new Set(), moves = [];
+          let gain = 0;
+          const ptr = [0, 0];
+          for (const sp of spots) {
+            const t4 = [sp.i, sp.i + 1, sp.i + S, sp.i + S + 1];
+            if (t4.some((t) => used.has(t))) continue;
+            const c = slow[sp.k][ptr[sp.k]];
+            if (!c || c.s <= sp.s) continue;
+            ptr[sp.k]++;
+            t4.forEach((t) => used.add(t));
+            moves.push({ k: sp.k, from: c.i, to: sp.i });
+            gain += c.s - sp.s;
+          }
+          const g = gain / nCore - opts.bannerCost * add.length;
+          if (g > 1e-9 && (!best || g > best.g)) best = { g, add, moves };
+        }
+        // compaction: a banner (with its mirror image) comes down when the cities that lose their
+        // territory can move to the fastest free spots still in territory (same trap, never rows
+        // 1-2) for less than the banner is worth
+        {
+          const done = new Set();
+          const free0 = [];
+          for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+            const i = y * S + x;
+            if (!covered(terr, i) || occ[i] || occ[i + 1] || occ[i + S] || occ[i + S + 1] || ctx.city[i] || ctx.city[i + 1] || ctx.city[i + S] || ctx.city[i + S + 1]) continue;
+            const k = near(i);
+            free0.push({ i, k, s: secsOf(i, k) });
+          }
+          free0.sort((p2, q) => p2.s - q.s || p2.i - q.i);
+          for (const b of banners) {
+            if (done.has(b)) continue;
+            let drop = [b];
+            if (axis) { const m = mirB(b); if (m !== b && banners.includes(m)) drop.push(m); }
+            drop.forEach((q) => done.add(q));
+            const rest = banners.filter((q) => !drop.includes(q));
+            if (!chained(rest)) continue;
+            const t2 = terrOf(rest);
+            const lost = [];
+            parts.forEach((p, k) => p.cityA.forEach((i) => { if (!covered(t2, i)) lost.push({ i, k }); }));
+            if (lost.some((c) => keep.has(c.i))) continue;
+            if (!lost.length) { const g = opts.bannerCost * drop.length; if (!best || g > best.g) best = { g, add: [], drop, moves: [] }; continue; }
+            // free spots still in territory (spots made of a lost city's tiles are not tried)
+            const spots = [[], []];
+            for (const sp of free0) if (covered(t2, sp.i)) spots[sp.k].push(sp);
+            const usedT = new Set(), moves = [];
+            let loss = 0, ok = true;
+            for (const c of lost.sort((p2, q) => secsOf(p2.i, p2.k) - secsOf(q.i, q.k) || p2.i - q.i)) {
+              const sp = spots[c.k].find((q) => ![q.i, q.i + 1, q.i + S, q.i + S + 1].some((t) => usedT.has(t)));
+              if (!sp) { ok = false; break; }
+              [sp.i, sp.i + 1, sp.i + S, sp.i + S + 1].forEach((t) => usedT.add(t));
+              moves.push({ k: c.k, from: c.i, to: sp.i });
+              loss += sp.s - secsOf(c.i, c.k);
+            }
+            if (!ok) continue;
+            const g = opts.bannerCost * drop.length - loss / nCore;
+            if (g > 1e-9 && (!best || g > best.g)) best = { g, add: [], drop, moves };
+          }
+        }
+        if (!best) break;
+        for (const mv of best.moves) { const a = parts[mv.k].cityA; a[a.indexOf(mv.from)] = mv.to; }
+        if (best.drop) banners = banners.filter((q) => !best.drop.includes(q));
+        banners = banners.concat(best.add);
+        changed = true;
+        // banners the moves left useless come down (the chain must hold)
+        for (let j = banners.length - 1; j >= 0; j--) {
+          const rest = banners.filter((_, q) => q !== j), t = terrOf(rest);
+          if (parts.every((p) => p.cityA.every((i) => covered(t, i))) && chained(rest)) banners = rest;
+        }
+      }
+      if (!changed) return null;
+      const placed = parts.map((p) => {
+        const tiles = [];
+        for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) tiles.push((p.ty + y) * S + p.tx + x);
+        for (const i of p.cityA) tiles.push(i, i + 1, i + S, i + S + 1);
+        return { tx: p.tx, ty: p.ty, cityA: p.cityA, tiles };
+      });
+      return { c: f.c, ctx, parts: placed, banners, connectors: f.connectors, optimal: f.optimal, mir: f.mir, polished: true };
+    }
+
     // 4. designs, sorted by average distance (rows: 1 = 8 pinwheel slots, 2 = next 16, ...)
     const designs = finals.map((f) => {
       const { ctx } = f;
@@ -1548,6 +1721,11 @@
         }
       }
       const { loose, looseFar } = countLoose();
+      // core = the fastest of each trap, as many as its cluster brought; the rest are extra slots
+      for (const k of [0, 1]) {
+        const mine = cities.filter((c) => c.k === k), n = mine.filter((c) => !c.extra).length;
+        mine.sort((a, b) => a.d[k] - b.d[k] || a.y - b.y || a.x - b.x).forEach((c, i) => { c.extra = i >= n; });
+      }
       const coreCities = cities.filter((c) => !c.extra);
       const rows = [0, 1].map((k) => rowAverages(coreCities.filter((c) => c.k === k).map((c) => c.d[k])));
       const coreD = coreCities.map((c) => c.d[c.k]);
@@ -1591,7 +1769,7 @@
           secs: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k && !c.extra).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v) }; }),
           secsAll: [0, 1].map((k) => { const v = cities.filter((c) => c.k === k).map((c) => marchSecs(c.d[k])); return { avg: v.reduce((a, b) => a + b, 0) / v.length, max: Math.max(...v), n: v.length }; }),
           hqShift: [ctx.ox + R - cx, ctx.oy + R - cy],
-          sym, symAxis, symPair: !!f.mir, short: Math.max(0, minC - cities.length), loose, looseFar,
+          sym, symAxis, symPair: !!f.mir, short: Math.max(0, minC - cities.length), loose, looseFar, polished: !!f.polished,
         },
       };
       const gd = toGameDesign(d);
