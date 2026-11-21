@@ -1001,6 +1001,14 @@
       return o;
     };
     const covered = (terr, i) => terr[i] && terr[i + 1] && terr[i + S] && terr[i + S + 1];
+    // a 2x2 at i whose mirror image overlaps an obstacle (or the window edge)
+    const mirObs = (i) => {
+      const x = i % S, y = (i / S) | 0;
+      const [mx, my] = axis === "x" ? [2 * R + 1 - x, y] : [x, 2 * R + 1 - y];
+      if (mx < 0 || my < 0 || mx + 1 >= S || my + 1 >= S) return true;
+      const m = my * S + mx;
+      return !!(ctx.city[m] || ctx.city[m + 1] || ctx.city[m + S] || ctx.city[m + S + 1]);
+    };
     const chained = (bs) => {
       const rects = [[R - 6, R - 6, R + 8, R + 8]].concat(bs.map((b) => [b % S - 3, ((b / S) | 0) - 3, b % S + 3, ((b / S) | 0) + 3]));
       const ok = new Uint8Array(rects.length); ok[0] = 1;
@@ -1015,13 +1023,39 @@
       for (const p of parts) for (const i of p.cityA) { xs.push(i % S); ys.push((i / S) | 0); }
       const x0 = Math.max(4, Math.min(...xs) - 5), x1 = Math.min(S - 5, Math.max(...xs) + 6), y0 = Math.max(4, Math.min(...ys) - 5), y1 = Math.min(S - 5, Math.max(...ys) + 6);
       let best = null;
+      // gaps copied from an obstacle: free 2x2 spots outside the territory, nestled against the hive,
+      // whose mirror image falls on an obstacle and that beat the trap's slowest movable city. The
+      // mirror must not copy a shape the obstacle made, so a banner that opens one may stand alone
+      // and comes free of its cost.
+      const img = [];
+      if (axis) {
+        const slowest = parts.map((p, k) => Math.max(0, ...p.cityA.filter((i) => !keep.has(i)).map((i) => secsOf(i, k))));
+        for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+          const i = y * S + x, t4 = [i, i + 1, i + S, i + S + 1];
+          if (x + 2 >= S || y + 2 >= S || t4.some((t) => occ[t] || ctx.city[t]) || covered(terr, i) || !mirObs(i)) continue;
+          let ring = 0;
+          for (let v = y - 1; v <= y + 2; v++) for (let u = x - 1; u <= x + 2; u++) if ((u < x || u > x + 1 || v < y || v > y + 1) && occ[v * S + u]) ring++;
+          if (ring >= 3 && secsOf(i, near(i)) < slowest[near(i)]) img.push(i);
+        }
+      }
+      const imgSet = new Set(img);
+      const nearImg = (b) => img.some((i) => b % S >= i % S - 2 && b % S <= i % S + 3 && ((b / S) | 0) >= ((i / S) | 0) - 2 && ((b / S) | 0) <= ((i / S) | 0) + 3);
       const tried = new Set();
       for (let by = y0; by <= y1; by++) for (let bx = x0; bx <= x1; bx++) {
         const b = by * S + bx;
-        if (occ[b] || ctx.ally[b] || tried.has(b)) continue;
-        let add = [b];
-        if (axis) { const m = mirB(b); if (m !== b) { if (m < 0 || m >= S * S || occ[m] || ctx.ally[m]) continue; add.push(m); } }
-        add.forEach((q) => tried.add(q));
+        if (occ[b] || ctx.ally[b]) continue;
+        const cands = [];
+        if (!axis) cands.push([b]);
+        else {
+          const m = mirB(b);
+          if (m === b) cands.push([b]);
+          else {
+            if (!tried.has(b) && m >= 0 && m < S * S && !occ[m] && !ctx.ally[m]) cands.push([b, m]);
+            if (nearImg(b)) cands.push([b]);
+            tried.add(b); tried.add(m);
+          }
+        }
+        for (const add of cands) {
         const bs = banners.concat(add);
         const touchesTerr = (q) => { const qx = q % S, qy = (q / S) | 0; for (let y = qy - 4; y <= qy + 4; y++) for (let x = qx - 4; x <= qx + 4; x++) if (x >= 0 && y >= 0 && x < S && y < S && terr[y * S + x]) return true; return false; };
         if (!add.every(touchesTerr)) continue;
@@ -1057,8 +1091,10 @@
           moves.push({ k: sp.k, from: c.i, to: sp.i });
           gain += c.s - sp.s;
         }
-        const g = gain / nCore - opts.bannerCost * add.length;
+        const free = moves.some((mv) => imgSet.has(mv.to)) ? 1 : 0;
+        const g = gain / nCore - opts.bannerCost * (add.length - free);
         if (g > 1e-9 && (!best || g > best.g)) best = { g, add, moves };
+        }
       }
       // compaction: a banner (with its mirror image) comes down when the cities that lose their
       // territory can move to the fastest free spots still in territory (same trap, never rows
@@ -1083,7 +1119,7 @@
           const t2 = terrOf(rest);
           const lost = [];
           parts.forEach((p, k) => p.cityA.forEach((i) => { if (!covered(t2, i)) lost.push({ i, k }); }));
-          if (lost.some((c) => keep.has(c.i))) continue;
+          if (lost.some((c) => keep.has(c.i) || (axis && mirObs(c.i)))) continue;
           if (!lost.length) { const g = opts.bannerCost * drop.length; if (!best || g > best.g) best = { g, add: [], drop, moves: [] }; continue; }
           // free spots still in territory (spots made of a lost city's tiles are not tried)
           const spots = [[], []];
@@ -1774,16 +1810,40 @@
       // can't be their own image (a 2x2 on a 3-wide middle) don't count either way. Best axis.
       const pieces = cities.map((c) => ["c", c.x, c.y, 2]).concat(bl.map(([x, y]) => ["b", x, y, 1]), traps.map(([x, y]) => ["t", x, y, 3]),
         extras.map((e) => ["e" + e.w, e.x, e.y, e.w]));
+      // A piece whose image falls on an obstacle doesn't count either (the obstacle owns that side);
+      // a free 2x2 nestled against the hive whose image is an obstacle, and that would beat the
+      // trap's slowest core city, counts as a miss: a gap the mirror copied from an obstacle.
+      const slowCore = [0, 1].map((k) => Math.max(0, ...cities.filter((c) => !c.extra && c.k === k).map((c) => c.d[k])));
       let sym = 0, symAxis = null;
       for (const ax of ["x", "y"]) {
         const have = new Set(pieces.map(([t, x, y]) => t + x + "," + y));
+        const obsAt = (x, y, w) => {
+          if (x < 0 || y < 0 || x + w > S || y + w > S) return true;
+          for (let v = y; v < y + w; v++) for (let u = x; u < x + w; u++) if (ctx.city[v * S + u]) return true;
+          return false;
+        };
         let n = 0, hit = 0;
         for (const [t, x, y, w] of pieces) {
           const [mx, my] = ax === "x" ? [2 * R + 3 - x - w, y] : [x, 2 * R + 3 - y - w];
           const a = ax === "x" ? x : y, m = ax === "x" ? mx : my;
           if (m !== a && Math.abs(m - a) < w) continue;   // overlaps its own image
+          if (!have.has(t + mx + "," + my) && obsAt(mx, my, w)) continue;
           n++;
           if (have.has(t + mx + "," + my)) hit++;
+        }
+        const gap = new Uint8Array(S * S);
+        for (let y = 1; y + 2 < S; y++) for (let x = 1; x + 2 < S; x++) {
+          const i = y * S + x, t4 = [i, i + 1, i + S, i + S + 1];
+          if (t4.some((j) => used[j] || gap[j] || ctx.city[j])) continue;
+          const [mx, my] = ax === "x" ? [2 * R + 1 - x, y] : [x, 2 * R + 1 - y];
+          if (!obsAt(mx, my, 2)) continue;
+          let ring = 0;
+          for (let v = y - 1; v <= y + 2; v++) for (let u = x - 1; u <= x + 2; u++) if ((u < x || u > x + 1 || v < y || v > y + 1) && used[v * S + u]) ring++;
+          if (ring < 3) continue;
+          const d = traps.map(([tx, ty]) => Math.hypot(x + 1 - tx - 1.5, y + 1 - ty - 1.5)), k = d[0] <= d[1] ? 0 : 1;
+          if (d[k] >= slowCore[k]) continue;
+          t4.forEach((j) => { gap[j] = 1; });
+          n++;
         }
         const v = n ? hit / n : 0;
         if (v > sym) { sym = v; symAxis = ax; }

@@ -525,7 +525,6 @@ $("run").onclick = () => {
     designs: +$("ndesigns").value || 4, tag: $("tag").value || "HIVE",
   };
   if ($("fixhq").checked) opts.radius = 0;
-  opts.refitMax = $("refit").checked ? 30 : 0;
   const trap = (a, b) => { const x = parseInt($(a).value, 10), y = parseInt($(b).value, 10); return Number.isFinite(x) && Number.isFinite(y) ? [x, y] : null; };
   opts.traps = [trap("t1x", "t1y"), trap("t2x", "t2y")];
   const t0 = Date.now();
@@ -534,7 +533,7 @@ $("run").onclick = () => {
     const m = e.data;
     if (m.type === "progress") {
       const p = m.p;
-      const txt = { modules: "Solving the ideal trap cluster…", screen: "Checked trap positions (" + (p.found || 0) + " candidates)…", refine: "Fitting banners and re-fitting clusters around obstacles…", repair: "Fitting clusters around obstacles…", hq: "Trying HQ positions…", polish: "Polishing designs…" }[p.stage] || p.stage;
+      const txt = { modules: "Solving the ideal trap cluster…", screen: "Checked trap positions (" + (p.found || 0) + " candidates)…", refine: "Fitting banners…", repair: "Fitting clusters around obstacles…", hq: "Trying HQ positions…", polish: "Polishing designs…" }[p.stage] || p.stage;
       $("runmsg").innerHTML = log.join("<br>") + (log.length ? "<br>" : "") + txt;
       $("prog").style.width = Math.round((p.frac || 0) * 100) + "%";
     } else if (m.type === "warn") {
