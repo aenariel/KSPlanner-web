@@ -3,7 +3,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const M = 1200;
-let world = null, base = null, staticLabels = [], smap = null, outposts = [], zoneMask = null;
+let world = null, base = null, staticLabels = [], smap = null, outposts = [], zoneMask = null, nodeMask = null;
 let hq = null;                 // [x, y] lower-left tile of the Badland HQ
 let own = { tag: "", banners: [] };   // current network from the CSV
 let forced = [], excluded = [];       // outpost anchors [x, y]
@@ -40,6 +40,12 @@ const THEMES = {
 };
 // structures coloured by family, as in KSMapper (both levels of an outpost share the colour)
 const STRUCT_COL = { "Builder's Guild": "#a04000", Armory: "#9a7d0a", "Scholar's": "#1a5276", Arsenal: "#880e4f", Forager: "#1e8449", Harvest: "#117a65", "Drill Camp": "#5d6d7e", Frontier: "#6e2c0c", Fortress: "#922b21", Sanctuary: "#6c3483" };
+/* A stronger shade of a colour for outlines: darker on the light map, brighter on the dark one. */
+function strong(c) {
+  const rgb = Array.isArray(c) ? c : [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+  const out = theme === "dark" ? rgb.map((v) => Math.round(v + (255 - v) * 0.45)) : rgb.map((v) => Math.round(v * 0.55));
+  return "rgb(" + out.join(",") + ")";
+}
 const structCol = (name) => STRUCT_COL[String(name || "").replace(/ \d+$/, "")] || "#922b21";
 let theme = (() => { try { const t = localStorage.getItem("ksplanner-map-theme"); if (t === "light" || t === "dark") return t; } catch (e) {} return window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; })();
 const TH = () => THEMES[theme];
@@ -109,6 +115,8 @@ async function init() {
     world = Hive.buildWorld(sm);
     paintBase(sm);
     zoneMask = new Uint8Array(M * M);
+    nodeMask = new Uint8Array(M * M);
+    for (const n of sm.nodes) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) nodeMask[(n.y + dy) * M + n.x + dx] = 1;
     for (const s of sm.structures) {
       const fx = Math.round(s.x + s.size / 2 - s.forbidden_zone / 2), fy = Math.round(s.y + s.size / 2 - s.forbidden_zone / 2);
       if (Net.KINDS.includes(s.name)) {
@@ -228,7 +236,8 @@ function draw() {
   for (const e of enemies) { const [x0, y0, w] = enemySq(e); rect(x0, y0, w, w, "rgba(231,76,60,.28)", null); }
   if (net) {
     if (terrCache.ref !== net.banners || terrCache.n !== net.removed.length) terrCache = { ref: net.banners, n: net.removed.length, set: territories(net) };
-    const paint = (set, col) => { g.fillStyle = col; for (const c of set) if (!world.terrain[c]) g.fillRect(c % M, (c / M) | 0, 1, 1); };
+    // nodes keep their own colour (captured ones get an outline below)
+    const paint = (set, col) => { g.fillStyle = col; for (const c of set) if (!world.terrain[c] && !nodeMask[c]) g.fillRect(c % M, (c / M) | 0, 1, 1); };
     paint(terrCache.set.gone, SHADE.removed);
     paint(terrCache.set.fresh, SHADE.fresh);
     paint(terrCache.set.kept, SHADE.kept);
@@ -238,16 +247,18 @@ function draw() {
   const fset = new Set(forced.map(key)), xset = new Set(excluded.map(key));
   for (const o of outposts) {
     const k = o.x + "," + o.y;
-    if (reached.has(k)) { const col = structCol(o.name); rect(o.fx, o.fy, o.fz, o.fz, col + "70", col, 2); }
-    if (fset.has(k)) { rect(o.fx, o.fy, o.fz, o.fz, "rgba(39,174,96,.25)", "#27ae60", 3); rect(o.x, o.y, o.size, o.size, "#27ae60", "#fff", 2); }
+    if (reached.has(k)) { const col = structCol(o.name); rect(o.fx, o.fy, o.fz, o.fz, col + "70", strong(col), 2.5); rect(o.x, o.y, o.size, o.size, null, strong(col), 2.5); }
+    // forced / excluded: a ring around the building only, so the zone still shows whether it is reached
+    if (fset.has(k)) rect(o.x - 1.5, o.y - 1.5, o.size + 3, o.size + 3, null, "#2ecc71", 3.5);
     if (xset.has(k)) {
-      rect(o.fx, o.fy, o.fz, o.fz, "rgba(60,60,60,.25)", "#ff3b30", 3);
+      rect(o.x - 1.5, o.y - 1.5, o.size + 3, o.size + 3, null, "#ff3b30", 3.5);
       g.strokeStyle = "#ff3b30"; g.lineWidth = 3 / view.s; g.beginPath();
-      g.moveTo(o.fx, o.fy); g.lineTo(o.fx + o.fz, o.fy + o.fz); g.moveTo(o.fx + o.fz, o.fy); g.lineTo(o.fx, o.fy + o.fz); g.stroke();
+      g.moveTo(o.x - 1.5, o.y - 1.5); g.lineTo(o.x + o.size + 1.5, o.y + o.size + 1.5); g.moveTo(o.x + o.size + 1.5, o.y - 1.5); g.lineTo(o.x - 1.5, o.y + o.size + 1.5); g.stroke();
     }
   }
   const edge = px >= 6 ? "rgba(0,0,0,.5)" : null;
-  if (net) for (const [x, y] of net.captured) rect(x, y, 2, 2, null, "#fff", 2);
+  // captured nodes: outlined in a stronger shade of their own colour
+  if (net) for (const [x, y, t] of net.captured) rect(x, y, 2, 2, null, strong(TH().node[Net.TYPES[t]]), 2.5);
   // banners as tile squares (as in the hive generator), grown at low zoom so the network still reads
   const sz = Math.max(1, 4 * dpr() / px), off = (sz - 1) / 2;
   const sq = (x, y, fill, ring) => {
@@ -468,10 +479,10 @@ $("loadcsv").onclick = () => {
   evaluateCurrent();
 };
 /* Score the CSV's network (same targets, enemies and rules as a run) to shade and list it. */
-function evaluateCurrent() {
+function evaluateCurrent(then) {
   if (!hq || !own.banners.length) return;
   const ev = new Worker("worker.js");
-  ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; showCurrent(); terrCache.ref = null; draw(); } ev.terminate(); };
+  ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; showCurrent(); terrCache.ref = null; draw(); if (then) then(); } ev.terminate(); };
   ev.postMessage({ kind: "evaluate", hx: hq[0], hy: hq[1], banners: own.banners, opts: options() });
 }
 $("clearcsv").onclick = () => {
@@ -480,6 +491,21 @@ $("clearcsv").onclick = () => {
   $("csvmsg").textContent = ""; $("current").hidden = true; changed();
 };
 $("clearout").onclick = () => { forced = []; excluded = []; changed(); };
+/* Force every outpost the CSV's network reaches (it stays reached in every design). */
+$("forcecur").onclick = () => {
+  if (!own.banners.length || !hq) { $("outmsg").innerHTML = '<span class="warn">Load a CSV with your network first.</span>'; return; }
+  const apply = () => {
+    const reached = current.outposts.map((o) => [o.x, o.y]);
+    const k = new Set(reached.map(key));
+    excluded = excluded.filter((p) => !k.has(key(p)));
+    for (const p of reached) if (!forced.some((q) => key(q) === key(p))) forced.push(p);
+    $("outmsg").textContent = reached.length + " outpost(s) the current network reaches are forced.";
+    changed();
+  };
+  if (current) return apply();
+  $("outmsg").textContent = "Scoring the current network…";
+  evaluateCurrent(apply);
+};
 // one checkbox per outpost kind (ids kind0..kind11, kept with the other fields)
 $("kinds").innerHTML = Net.KINDS.map((k, i) => '<label class="check"><input id="kind' + i + '" type="checkbox" checked> ' + k + "</label>").join("");
 for (let i = 0; i < Net.KINDS.length; i++) $("kind" + i).addEventListener("change", refreshAll);
@@ -571,20 +597,38 @@ $("run").onclick = () => {
 };
 
 const nodesTxt = (n) => Net.TYPES.map((t) => n[t]).join(" / ");
-function statsHtml(d) {
-  const T = Net.TYPES.map((t) => d.targets[t]);
+/* Summary as a table; with the CSV's network scored too, side by side with it and the change. */
+function statsHtml(d, cmp) {
+  const T = {};
+  Net.TYPES.forEach((t) => { T[t] = d.targets[t]; });
+  const kept = (x) => (x === current ? own.banners.length : x.kept || 0);
   const rows = [
-    ["Banners", d.banners],
-    ["Empty banners", d.empty],
-    ["Already built (kept) / new to build", (d.kept || 0) + " / " + (d.banners - (d.kept || 0))],
-    ...(d === current || !own.banners.length ? [] : [["Already built, taken down", own.banners.length - (d.kept || 0)]]),
-    ["Cost (banners, kept ones cheaper, + extra for empties)", d.cost.toFixed(1)],
-    ["Nodes bread / wood / stone / iron", nodesTxt(d.nodes)],
-    ["Per hour", Net.TYPES.map((t) => kph(d.nodes[t])).join(" / ")],
-    ["Minimum", T.join(" / ")],
-    ["Outpost kinds reached", d.goals.filter((g) => g.met).length + " of " + d.goals.length],
+    { l: "Banners", v: (x) => x.banners, better: -1 },
+    ...(own.banners.length ? [
+      { l: "Already built", v: kept, better: 0 },
+      { l: "New to build", v: (x) => x.banners - kept(x), better: -1 },
+      { l: "Taken down", v: (x) => (x === current ? 0 : own.banners.length - kept(x)), better: -1 },
+    ] : []),
+    { l: "Empty", v: (x) => x.empty, better: -1 },
+    ...Net.TYPES.map((t) => ({ l: t[0].toUpperCase() + t.slice(1), ls: "min " + T[t], v: (x) => x.nodes[t], sub: (x) => kph(x.nodes[t]) + "/h", min: T[t], better: 1 })),
+    { l: "Outposts", v: (x) => x.goals.filter((g) => g.met).length, sub: (x) => "of " + x.goals.length, better: 1 },
+    { l: "Cost", v: (x) => Math.round(x.cost * 10) / 10, better: -1, title: "Banners (the ones already built count less), plus the extra for empty banners: what the networks are ranked by" },
   ];
-  return rows.map(([a, b]) => "<div><span>" + a + "</span><span>" + b + "</span></div>").join("") +
+  const cell = (r, x) => {
+    const v = r.v(x), short = r.min != null && v < r.min;
+    return '<td class="n' + (short ? " bad" : "") + '">' + v + (r.sub ? '<span class="sub">' + r.sub(x) + "</span>" : "") + "</td>";
+  };
+  const change = (r) => {
+    const a = r.v(cmp), b = r.v(d), dv = Math.round((b - a) * 10) / 10;
+    if (!dv) return '<td class="n mute">=</td>';
+    // above the minimum on both sides, more resources are worth nothing: no colour
+    const neutral = !r.better || (r.min != null && a >= r.min && b >= r.min);
+    const good = dv * r.better > 0;
+    return '<td class="n ' + (neutral ? "mute" : good ? "good" : "bad") + '">' + (dv > 0 ? "+" : "−") + Math.abs(dv) + "</td>";
+  };
+  const head = cmp ? "<tr><th></th><th>Current</th><th>Proposed</th><th>Change</th></tr>" : "";
+  const body = rows.map((r) => "<tr" + (r.title ? ' title="' + r.title + '"' : "") + "><td>" + r.l + (r.ls ? '<span class="sub">' + r.ls + "</span>" : "") + "</td>" + (cmp ? cell(r, cmp) : "") + cell(r, d) + (cmp ? change(r) : "") + "</tr>").join("");
+  return '<table class="stat' + (cmp ? " cmp" : "") + '">' + head + body + "</table>" +
     d.errors.map((w) => '<div class="err">' + w + "</div>").join("") +
     (d.warnings || []).map((w) => '<div class="warn">' + w + "</div>").join("");
 }
@@ -602,7 +646,7 @@ function pick(i) {
   sel = i;
   [...$("designs").children].forEach((b, j) => b.classList.toggle("sel", j === i));
   const d = results[i];
-  $("stats").innerHTML = statsHtml(d);
+  $("stats").innerHTML = statsHtml(d, current && own.banners.length ? current : null);
   $("goals").innerHTML = "<tr><th>Kind</th><th>Outpost</th></tr>" + d.goals.map((g) => "<tr><td>" + g.kind + (g.forced ? ' <span class="ok">forced</span>' : "") + "</td><td>" + (g.met ? g.at.map(key).join(", ") : '<span class="err">not reached</span>') + "</td></tr>").join("");
   $("csv").value = Net.toCsv(hq, d.design, d.emptyFlags, own.tag || $("tag").value || "NET", own.banners);
   $("showcur").checked = false;
@@ -612,7 +656,9 @@ function pick(i) {
 function showCurrent() {
   if (!current) return;
   $("current").hidden = false;
-  $("curstats").innerHTML = statsHtml(current);
+  $("curstats").innerHTML = statsHtml(current, null);
+  // the selected network's table gains the comparison column once the current one is scored
+  if (results[sel]) $("stats").innerHTML = statsHtml(results[sel], current);
 }
 $("copy").onclick = async () => {
   try { await navigator.clipboard.writeText($("csv").value); $("copymsg").textContent = "Copied."; }
