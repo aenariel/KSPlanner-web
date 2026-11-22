@@ -11,8 +11,9 @@
  * Links are checked on owned tiles only (KSMapper's rule, stricter than the game's near an
  * outpost zone), so a plan is valid in both. A banner stands on a free tile. A resource node (2x2) counts when fully inside territory. An
  * outpost counts when territory touches its 15x15 no-build zone, whose tiles are never owned.
- * Coordinates are lower-left tiles. Other alliances appear only as enemy banners and HQs given in
- * opts.enemies: their squares are never ours and take no banner. opts.forced / opts.excluded list
+ * Coordinates are lower-left tiles. Other alliances appear as enemy banners and HQs given in
+ * opts.enemies (their squares) and/or as a territory mask read by the scan (opts.mask, tile by
+ * tile): that ground is never ours and takes no banner. opts.forced / opts.excluded list
  * outposts (lower-left tiles) the network must reach / must not count on.
  *
  * Method: pass 1 builds a network with as many resources as it can (the outposts reached on the
@@ -43,20 +44,32 @@
   }
 
   // ---------------------------------------------------------------- static data
-  function prepare(world, enemies) {
+  /* Other alliances' ground: enemy banners and HQs (squares), and/or a territory mask from the
+     scan (opts.mask = { key, runs }: tile runs per row, flat [y, x1, x2, ...], inclusive). Never
+     ours, no banner on it (they built first), links can't cross it, nodes under it can't count. */
+  function prepare(world, enemies, mask) {
     const base = prepareBase(world);
-    if (!enemies || !enemies.length) return base;
-    const key = JSON.stringify(enemies);
+    const hasE = enemies && enemies.length, hasM = mask && mask.runs && mask.runs.length;
+    if (!hasE && !hasM) return base;
+    const key = (hasE ? JSON.stringify(enemies) : "") + "|" + (hasM ? mask.key || String(mask.runs.length) : "");
     if (world._netE && world._netE.key === key) return world._netE.P;
-    // other alliances' territory: never ours, no banner on it (they built first)
     const noOwn = base.noOwn.slice();
-    for (const e of enemies) {
+    if (hasE) for (const e of enemies) {
       const r = e.type === "hq" ? [e.x - 6, e.y - 6, e.x + 8, e.y + 8] : [e.x - 3, e.y - 3, e.x + 3, e.y + 3];
       for (let y = Math.max(0, r[1]); y <= Math.min(MAP - 1, r[3]); y++)
         for (let x = Math.max(0, r[0]); x <= Math.min(MAP - 1, r[2]); x++) noOwn[y * MAP + x] = 1;
     }
+    let maskTiles = 0;
+    if (hasM) {
+      const R = mask.runs;
+      for (let i = 0; i + 2 < R.length; i += 3) {
+        const y = R[i], a = Math.max(0, R[i + 1]), b = Math.min(MAP - 1, R[i + 2]);
+        if (y < 0 || y >= MAP) continue;
+        for (let x = a; x <= b; x++) { if (!noOwn[y * MAP + x]) maskTiles++; noOwn[y * MAP + x] = 1; }
+      }
+    }
     const outposts = base.outposts.map((o) => Object.assign({}, o, { ring: o.ring.filter((c) => !noOwn[c]) }));
-    const P = Object.assign({}, base, { noOwn, outposts, zI: integralOf(noOwn), enemies: enemies.length });
+    const P = Object.assign({}, base, { noOwn, outposts, zI: integralOf(noOwn), enemies: hasE ? enemies.length : 0, maskTiles });
     world._netE = { key, P };
     return P;
   }
@@ -153,7 +166,7 @@
   // ---------------------------------------------------------------- network state
   function makeState(world, hx, hy, opts) {
     opts = opts || {};
-    const P = prepare(world, opts.enemies);
+    const P = prepare(world, opts.enemies, opts.mask);
     const G = goalsOf(P, opts);
     const st = {
       world, P, hx, hy, goals: G.goals, warnings: G.warnings,
@@ -732,8 +745,13 @@
     });
     const captured = [];
     for (const nd of st.P.nodes) if (st.full[nd.i]) captured.push([nd.x, nd.y, nd.t]);
+    // banners standing on other alliances' ground (only a pasted network can: the data disagree)
+    const onEnemy = st.banners.filter(([x, y]) => st.P.noOwn[y * MAP + x]).map((b) => b.slice());
+    const warnings = st.warnings.slice();
+    if (onEnemy.length) warnings.push(onEnemy.length + " banner(s) stand on enemy ground or unseen tiles (" +
+      onEnemy.slice(0, 6).map((b) => b.join(",")).join(" ") + (onEnemy.length > 6 ? " …" : "") + "): the map data and this network disagree");
     return {
-      goals, captured, warnings: st.warnings,
+      goals, captured, warnings, onEnemy,
       kept: st.banners.filter(([x, y]) => st.existing.has(y * MAP + x)).length,
       banners: st.banners.length,
       empty: empty.filter(Boolean).length,

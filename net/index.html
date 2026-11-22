@@ -79,7 +79,7 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.21.10</div>
+    <div class="msg" id="version">Version 2026.11.22.1</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <details class="sec" open><summary>Your alliance</summary>
@@ -101,6 +101,7 @@
       <button id="m-out" data-mode="outpost">Outposts</button>
       <button id="m-eb" data-mode="ebanner">Enemy banner</button>
       <button id="m-eh" data-mode="ehq">Enemy HQ</button>
+      <button id="m-piece" data-mode="piece">Scan piece</button>
     </div>
     <div class="msg" id="modehelp"></div>
     </details>
@@ -121,6 +122,16 @@
     <div class="row" style="margin-top:4px"><button id="kall">All</button><button id="knone">None</button></div>
     <div class="row" style="margin-top:6px"><button id="forcecur" title="Force every outpost the network from the CSV reaches">Force current</button><button id="clearout">Clear forced / excluded</button></div>
     <div class="msg" id="outmsg"></div>
+    </details>
+
+    <details class="sec" open><summary>Enemy territory (scan)</summary>
+    <div class="msg">Load the <code>territory_mask.json</code> of a territory scan: every other alliance's ground tile by tile, so your banners can pass diagonally between enemy squares that only touch at a corner. Pieces with your alliance tag are left out; click one in the list (or pick "Scan piece" and click the map) to switch it on or off.</div>
+    <div class="row"><input id="maskfile" type="file" accept=".json,application/json" style="width:100%"></div>
+    <label>Unseen tiles <select id="unseenMode" style="width:150px"><option value="enemy">are enemy ground</option><option value="touch" selected>enemy if they touch an enemy</option><option value="free">are free</option></select></label>
+    <div class="msg" style="margin-top:0">Tiles the scan never saw: the icons and names of HQs and outposts hide blocks of them, right where networks meet. "Enemy if they touch an enemy": a block of unseen tiles is enemy ground when it touches a tile of an enemy piece, else free. Inside your own HQ's and CSV banners' squares they always count as yours. The networks list the unseen blocks they rely on, to check in the game.</div>
+    <div class="msg" id="maskmsg"></div>
+    <div class="list" id="masklist" style="max-height:260px;overflow:auto"></div>
+    <div class="row" style="margin-top:6px"><button id="mall">All on</button><button id="mnone">All off</button><button id="mown">Reset</button><button id="mclear">Remove scan</button></div>
     </details>
 
     <details class="sec" open><summary>Enemies</summary>
@@ -174,7 +185,9 @@
       <div class="sw" style="background:linear-gradient(90deg,#a04000 20%,#9a7d0a 20% 40%,#1a5276 40% 60%,#880e4f 60% 80%,#117a65 80%)"></div><div>Outposts by kind, as in KSMapper; the ones reached filled and outlined</div>
       <div class="sw" style="background:transparent;border:2px solid #2ecc71"></div><div>Forced outpost (ring around the building)</div>
       <div class="sw" style="background:transparent;border:2px solid #ff3b30"></div><div>Excluded outpost (red ring and cross around the building)</div>
-      <div class="sw" style="background:rgba(231,76,60,.45)"></div><div>Enemy territory (banner 7x7, HQ 15x15)</div>
+      <div class="sw" style="background:rgba(231,76,60,.45)"></div><div>Enemy territory (banner 7x7, HQ 15x15, or a scan piece tile by tile)</div>
+      <div class="sw" style="background:rgba(120,165,230,.35)"></div><div>Scan piece switched off (your own, or by hand)</div>
+      <div class="sw" style="background:rgba(150,150,150,.55)"></div><div>Unseen tile in the scan (strong grey: counted as enemy ground; light grey: taken as free)</div>
       <div class="sw" style="background:#7f8c8d;border:1px solid #2c3e50"></div><div>Current network (from the CSV)</div>
       <div class="sw" style="background:linear-gradient(90deg,#deba46 25%,#346e30 25% 50%,#cccccc 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
       <div class="sw" style="background:rgb(112,102,90)"></div><div>Mountain</div>

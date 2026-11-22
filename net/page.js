@@ -9,6 +9,10 @@ let own = { tag: "", banners: [] };   // current network from the CSV
 let forced = [], excluded = [];       // outpost anchors [x, y]
 let enemies = [];              // { type: "banner" | "hq", x, y, src: "csv" | "map" }
 let results = [], sel = -1, current = null;
+/* Territory mask from a scan (territory_mask.json): pieces tile by tile and the unseen tiles.
+   pieceOn[i]: null = automatic (on unless it carries your tag), true / false = set by hand. */
+let scan = null, pieceOn = [];
+let scanR = null;              // { piece: Int16Array (index + 1), unseen: Uint8Array, forbid: Uint8Array, runs, key, tiles }
 let mode = "view";
 const view = { cu: 600, cv: 600, s: 0.6 };
 const cv = $("map"), g = cv.getContext("2d");
@@ -164,7 +168,7 @@ function resize() {
 
 const enemySq = (e) => (e.type === "hq" ? [e.x - 6, e.y - 6, 15] : [e.x - 3, e.y - 3, 7]);
 function enemyMask() {
-  const m = new Uint8Array(M * M);
+  const m = scanR ? scanR.forbid.slice() : new Uint8Array(M * M);
   for (const e of enemies) {
     const [x0, y0, w] = enemySq(e);
     for (let y = Math.max(0, y0); y < Math.min(M, y0 + w); y++) for (let x = Math.max(0, x0); x < Math.min(M, x0 + w); x++) m[y * M + x] = 1;
@@ -172,6 +176,166 @@ function enemyMask() {
   return m;
 }
 let enMask = null;
+
+// ---------------------------------------------------------------- territory mask from a scan
+const MASK_STORE = "ksplanner-net-mask";
+const tagOfPiece = (p) => [...(p.tags || []), p.probable, p.label_tag, String(p.name || "").replace(/\?$/, "")].filter(Boolean).map((t) => t.toLowerCase());
+const isOwnPiece = (p) => !!own.tag && tagOfPiece(p).includes(own.tag.toLowerCase());
+const pieceEnabled = (i) => (pieceOn[i] != null ? pieceOn[i] : !isOwnPiece(scan.pieces[i]));
+function paintRuns(runs, fn) {
+  for (let i = 0; i + 2 < runs.length; i += 3) {
+    const y = runs[i]; if (y < 0 || y >= M) continue;
+    for (let x = Math.max(0, runs[i + 1]); x <= Math.min(M - 1, runs[i + 2]); x++) fn(y * M + x);
+  }
+}
+function encodeRuns(mask) {
+  const out = [];
+  for (let y = 0; y < M; y++) {
+    let x = 0;
+    while (x < M) {
+      if (!mask[y * M + x]) { x++; continue; }
+      const a = x; while (x < M && mask[y * M + x]) x++;
+      out.push(y, a, x - 1);
+    }
+  }
+  return out;
+}
+function hashRuns(r) { let h = 2166136261; for (const v of r) { h ^= v; h = Math.imul(h, 16777619); } return (h >>> 0).toString(36) + "." + r.length; }
+/* The scan's raster: which piece holds each tile, the unseen tiles, and what the solver must treat as
+   enemy ground (enabled pieces, plus the unseen tiles when that box is ticked, except inside your own
+   HQ's and CSV banners' squares, where the icons of your own buildings hide the ground). */
+function buildScan() {
+  scanR = null;
+  if (!scan) return;
+  const t0 = performance.now();
+  const piece = new Int16Array(M * M), unseen = new Uint8Array(M * M), forbid = new Uint8Array(M * M);
+  scan.pieces.forEach((p, i) => paintRuns(p.runs, (c) => { piece[c] = i + 1; }));
+  paintRuns(scan.unseen.runs, (c) => { unseen[c] = 1; });
+  const mine = new Uint8Array(M * M);
+  const sq = (x0, y0, x1, y1) => { for (let y = Math.max(0, y0); y <= Math.min(M - 1, y1); y++) for (let x = Math.max(0, x0); x <= Math.min(M - 1, x1); x++) mine[y * M + x] = 1; };
+  if (hq) sq(hq[0] - 6, hq[1] - 6, hq[0] + 8, hq[1] + 8);
+  for (const [x, y] of own.banners) sq(x - 3, y - 3, x + 3, y + 3);
+  const on = scan.pieces.map((_, i) => pieceEnabled(i));
+  const umode = $("unseenMode").value;
+  let tiles = 0, unseenCounted = 0, unseenMine = 0;
+  for (let c = 0; c < M * M; c++) { const p = piece[c]; if (p && on[p - 1]) { forbid[c] = 1; tiles++; } }
+  // blocks of unseen tiles (8-neighbour): size, middle tile, and whether they touch an enemy piece
+  const blockId = new Int32Array(M * M), blocks = [];
+  for (let s = 0; s < M * M; s++) {
+    if (!unseen[s] || blockId[s]) continue;
+    const id = blocks.length + 1, list = [s];
+    blockId[s] = id;
+    let enemy = false, sx = 0, sy = 0;
+    for (let k = 0; k < list.length; k++) {
+      const c = list[k], x = c % M, y = (c / M) | 0;
+      sx += x; sy += y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy;
+        if (X < 0 || Y < 0 || X >= M || Y >= M) continue;
+        const d = Y * M + X;
+        if (unseen[d]) { if (!blockId[d]) { blockId[d] = id; list.push(d); } }
+        else if (forbid[d]) enemy = true;
+      }
+    }
+    blocks.push({ id, size: list.length, x: Math.round(sx / list.length), y: Math.round(sy / list.length), enemy });
+  }
+  for (let c = 0; c < M * M; c++) {
+    if (!unseen[c]) continue;
+    if (mine[c]) { unseenMine++; continue; }
+    if (umode === "enemy" || (umode === "touch" && blocks[blockId[c] - 1].enemy)) { forbid[c] = 1; unseenCounted++; }
+  }
+  const runs = encodeRuns(forbid);
+  scanR = { piece, unseen, forbid, mine, blockId, blocks, runs, key: hashRuns(runs), tiles, unseenCounted, unseenMine };
+  paintScan();
+  console.log("[scan mask] " + on.filter(Boolean).length + "/" + on.length + " pieces on, " + tiles + " enemy tiles, " + unseenCounted +
+    " unseen tiles counted as enemy (mode " + umode + ", " + blocks.length + " blocks), " + unseenMine + " unseen tiles inside your own squares, " + runs.length / 3 + " runs (" + Math.round(performance.now() - t0) + " ms)");
+}
+let scanImg = null;
+function paintScan() {
+  if (!scanR) { scanImg = null; return; }
+  scanImg = scanImg || document.createElement("canvas");
+  scanImg.width = M; scanImg.height = M;
+  const cg = scanImg.getContext("2d"), img = cg.createImageData(M, M), d = img.data;
+  const on = scan.pieces.map((_, i) => pieceEnabled(i));
+  for (let c = 0; c < M * M; c++) {
+    const p = scanR.piece[c], o = c * 4;
+    let col = null;
+    if (p) col = on[p - 1] ? [231, 76, 60, 80] : [120, 165, 230, 70];
+    else if (scanR.unseen[c] && !scanR.mine[c]) col = scanR.forbid[c] ? [150, 150, 150, 150] : [150, 150, 150, 60];
+    if (col) { d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = col[3]; }
+  }
+  cg.putImageData(img, 0, 0);
+}
+function scanList() {
+  if (!scan) { $("masklist").innerHTML = ""; $("maskmsg").textContent = "No scan loaded."; return; }
+  const big = [], small = [];
+  scan.pieces.forEach((p, i) => (p.tiles >= 49 ? big : small).push(i));
+  const row = (i) => {
+    const p = scan.pieces[i], on = pieceEnabled(i);
+    return '<div><label class="check" style="margin:0"><input type="checkbox" data-i="' + i + '"' + (on ? " checked" : "") + '> <span class="sw" style="display:inline-block;background:' + p.colour + '"></span> ' +
+      p.name + (isOwnPiece(p) ? ' <span class="ok">yours</span>' : "") + '</label><span class="msg" style="margin:0">' + p.tiles + (p.hqs.length ? " · HQ " + p.hqs.map(key).join(" ") : "") + "</span></div>";
+  };
+  const smallOn = small.filter(pieceEnabled).length;
+  $("masklist").innerHTML = big.map(row).join("") + (small.length ? '<div><label class="check" style="margin:0"><input type="checkbox" data-small="1"' + (smallOn ? " checked" : "") + "> " + small.length + " small pieces (under 49 tiles, " + small.reduce((a, i) => a + scan.pieces[i].tiles, 0) + " tiles)" + (smallOn && smallOn < small.length ? " · " + smallOn + " on" : "") + "</label></div>" : "");
+  for (const b of $("masklist").querySelectorAll("input[data-i]")) b.onchange = () => { pieceOn[+b.dataset.i] = b.checked; scanChanged(); };
+  const sb = $("masklist").querySelector("input[data-small]");
+  if (sb) sb.onchange = () => { for (const i of small) pieceOn[i] = sb.checked; scanChanged(); };
+  const nOn = scan.pieces.filter((_, i) => pieceEnabled(i)).length;
+  const r = scan.region;
+  $("maskmsg").innerHTML = "Kingdom " + (scan.kingdom != null ? scan.kingdom : "?") + ", scan " + (scan.scan || "?") + " (" + (scan.created || "") + "), region " + r[0] + "," + r[1] + " – " + r[2] + "," + r[3] + ". " +
+    nOn + " of " + scan.pieces.length + " pieces are enemy ground (" + (scanR ? scanR.tiles : 0) + " tiles); " + scan.unseen.tiles + " tiles unseen" +
+    (scanR ? " in " + scanR.blocks.length + " blocks, " + (scanR.unseenCounted ? scanR.unseenCounted + " counted as enemy" : "none counted as enemy") + (scanR.unseenMine ? ", " + scanR.unseenMine + " inside your own squares (yours)" : "") : "") + "." +
+    (own.tag ? "" : ' <span class="warn">Load your CSV (or type your tag) so your own pieces are left out.</span>');
+}
+function scanChanged() { buildScan(); scanList(); saveScanChoice(); refreshAll(); }
+function saveScanChoice() { try { const v = JSON.parse(localStorage.getItem(STATE) || "{}"); v.pieceOn = pieceOn; localStorage.setItem(STATE, JSON.stringify(v)); } catch (e) {} }
+function setScan(m, keepChoice) {
+  scan = m;
+  if (!keepChoice) pieceOn = m ? m.pieces.map(() => null) : [];
+  buildScan(); scanList(); refreshAll();
+}
+$("maskfile").onchange = async () => {
+  const f = $("maskfile").files[0];
+  if (!f) return;
+  try {
+    const m = JSON.parse(await f.text());
+    if (m.format !== "ksplanner-territory-mask" || !Array.isArray(m.pieces) || !m.unseen) throw new Error("not a territory_mask.json from the scanner");
+    try { localStorage.setItem(MASK_STORE, JSON.stringify(m)); } catch (e) { console.warn("[scan mask] not kept in the browser: " + e.message); }
+    setScan(m, false); saveScanChoice();
+  } catch (e) { $("maskmsg").innerHTML = '<span class="err">Could not read ' + f.name + ": " + e.message + "</span>"; }
+  $("maskfile").value = "";
+};
+$("unseenMode").addEventListener("change", () => { buildScan(); scanList(); refreshAll(); });
+$("mall").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => true); scanChanged(); } };
+$("mnone").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => false); scanChanged(); } };
+$("mown").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => null); scanChanged(); } };
+$("mclear").onclick = () => { try { localStorage.removeItem(MASK_STORE); } catch (e) {} pieceOn = []; setScan(null); saveScanChoice(); };
+/* Banners of a network outside the scanned region, and unseen tiles inside its squares counted as enemy. */
+function scanNotes(banners) {
+  if (!scanR || !banners) return [];
+  const [x1, y1, x2, y2] = scan.region;
+  const out = banners.filter(([x, y]) => x - 3 < x1 || y - 3 < y1 || x + 3 > x2 || y + 3 > y2).length;
+  // unseen blocks taken as free (not yours) that this network's squares rely on
+  const used = new Map();
+  for (const [bx, by] of banners) for (let y = by - 3; y <= by + 3; y++) for (let x = bx - 3; x <= bx + 3; x++) {
+    if (x < 0 || y < 0 || x >= M || y >= M) continue;
+    const c = y * M + x;
+    if (!scanR.unseen[c] || scanR.forbid[c] || scanR.mine[c]) continue;
+    const b = scanR.blockId[c];
+    const u = used.get(b) || { tiles: new Set(), banners: new Set() };
+    u.tiles.add(c); if (x === bx && y === by) u.banners.add(c);
+    used.set(b, u);
+  }
+  const notes = [];
+  if (out) notes.push(out + " banner(s) reach outside the scanned region: what stands there is unknown");
+  if (used.size) {
+    const list = [...used.entries()].sort((a, b) => b[1].tiles.size - a[1].tiles.size);
+    const nt = list.reduce((a, [, u]) => a + u.tiles.size, 0), nb = list.reduce((a, [, u]) => a + u.banners.size, 0);
+    notes.push("Relies on " + nt + " unseen tile(s) taken as free, in " + list.length + " block(s)" + (nb ? ", " + nb + " banner(s) standing on them" : "") +
+      ". Check in the game around: " + list.slice(0, 12).map(([b, u]) => { const k = scanR.blocks[b - 1]; return k.x + "," + k.y + " (" + u.tiles.size + (u.banners.size ? ", " + u.banners.size + " b" : "") + ")"; }).join(", ") + (list.length > 12 ? " …" : ""));
+  }
+  return notes;
+}
 
 /* The network on the map: the selected result, or the CSV's current network. */
 /* The network on the map. With a result: its banners, each marked kept (already in the CSV's network)
@@ -232,7 +396,8 @@ function draw() {
   drawMapLines();
   const px = view.s * dpr();
   const net = shown();
-  // enemy ground
+  // enemy ground: the scan's pieces tile by tile, then marked banners and HQs
+  if (scanImg) g.drawImage(scanImg, 0, 0);
   for (const e of enemies) { const [x0, y0, w] = enemySq(e); rect(x0, y0, w, w, "rgba(231,76,60,.28)", null); }
   if (net) {
     if (terrCache.ref !== net.banners || terrCache.n !== net.removed.length) terrCache = { ref: net.banners, n: net.removed.length, set: territories(net) };
@@ -336,7 +501,12 @@ function describeAt(x, y) {
   for (const e of enemies) {
     if (e.type === "hq" ? inBox(e.x, e.y, 3) : (e.x === x && e.y === y)) out.push("Enemy " + (e.type === "hq" ? "HQ " : "banner ") + key([e.x, e.y]) + (e.src === "csv" ? " (from the CSV)" : ""));
   }
-  if (enMask && enMask[y * M + x] && !out.some((t) => t.startsWith("Enemy"))) out.push("enemy territory");
+  if (scanR && x >= 0 && y >= 0 && x < M && y < M) {
+    const c = y * M + x, p = scanR.piece[c];
+    if (p) { const q = scan.pieces[p - 1]; out.push(q.name + " territory (scan, " + q.tiles + " tiles" + (pieceEnabled(p - 1) ? ")" : ", switched off)")); }
+    else if (scanR.unseen[c]) out.push("unseen in the scan" + (scanR.mine[c] ? " (inside your squares: yours)" : scanR.forbid[c] ? " (counted as enemy)" : ""));
+  }
+  if (enMask && enMask[y * M + x] && !out.some((t) => t.startsWith("Enemy") || t.includes("(scan") || t.startsWith("unseen"))) out.push("enemy territory");
   for (const o of outposts) {
     if (!inBox(o.fx, o.fy, o.fz)) continue;
     const k = o.x + "," + o.y;
@@ -413,12 +583,13 @@ const MODE_HELP = {
   outpost: "Click an outpost (anywhere in its no-build zone): normal → forced → excluded → normal.",
   ebanner: "Click a tile to put an enemy banner there, or click one to take it away.",
   ehq: "Click the middle of an enemy HQ to add it, or click one to take it away.",
+  piece: "Click a piece of the loaded scan to switch it on (enemy ground) or off.",
 };
 function setMode(m) {
   mode = m;
   for (const b of document.querySelectorAll(".modes button")) b.classList.toggle("on", b.dataset.mode === m);
   $("modehelp").textContent = MODE_HELP[m];
-  $("modebadge").textContent = "Click: " + { view: "move only", hq: "set HQ", outpost: "outpost state", ebanner: "enemy banner", ehq: "enemy HQ" }[m];
+  $("modebadge").textContent = "Click: " + { view: "move only", hq: "set HQ", outpost: "outpost state", ebanner: "enemy banner", ehq: "enemy HQ", piece: "scan piece" }[m];
   saveState();
 }
 for (const b of document.querySelectorAll(".modes button")) b.onclick = () => setMode(b.dataset.mode);
@@ -439,6 +610,13 @@ function clickTile(x, y) {
     if (i >= 0) enemies.splice(i, 1); else enemies.push({ type: "banner", x, y, src: "map" });
     return changed();
   }
+  if (mode === "piece") {
+    if (!scanR || x < 0 || y < 0 || x >= M || y >= M) return;
+    const p = scanR.piece[y * M + x];
+    if (!p) return;
+    pieceOn[p - 1] = !pieceEnabled(p - 1);
+    return scanChanged();
+  }
   if (mode === "ehq") {
     const i = enemies.findIndex((e) => e.type === "hq" && x >= e.x && x < e.x + 3 && y >= e.y && y < e.y + 3);
     if (i >= 0) enemies.splice(i, 1); else enemies.push({ type: "hq", x: x - 1, y: y - 1, src: "map" });
@@ -452,6 +630,7 @@ function setHQ(x, y, centre) {
   hq = [x, y];
   $("hx").value = x; $("hy").value = y;
   if (centre) { view.cu = x + 1.5; view.cv = y + 1.5; if (view.s < 1) view.s = 1.2; }
+  if (scan) { buildScan(); scanList(); }
   changed();
 }
 
@@ -474,6 +653,7 @@ $("loadcsv").onclick = () => {
   const plainsHq = rows.some((r) => r[0] === "hq" && r[3] === tag && inPlains(+r[1], +r[2]));
   $("csvmsg").textContent = tag + ": " + own.banners.length + " banners" + (h ? ", HQ " + h[1] + "," + h[2] : ", no Badland HQ") + (plainsHq ? " (Plains HQ left out)" : "") + (ne ? "; " + ne + " enemy banners / HQs from other tags" : "") + ".";
   results = []; sel = -1; $("results").hidden = true; current = null;
+  buildScan(); scanList();
   if (h) setHQ(+h[1], +h[2], true); else changed();
   fit();
   evaluateCurrent();
@@ -488,8 +668,9 @@ function evaluateCurrent(then) {
 $("clearcsv").onclick = () => {
   $("csvin").value = ""; own = { tag: "", banners: [] }; current = null;
   enemies = enemies.filter((e) => e.src !== "csv");
-  $("csvmsg").textContent = ""; $("current").hidden = true; changed();
+  $("csvmsg").textContent = ""; $("current").hidden = true; buildScan(); scanList(); changed();
 };
+$("tag").addEventListener("change", () => { if (!own.banners.length) own.tag = $("tag").value.trim(); if (scan) { buildScan(); scanList(); refreshAll(); } });
 $("clearout").onclick = () => { forced = []; excluded = []; changed(); };
 /* Force every outpost the CSV's network reaches (it stays reached in every design). */
 $("forcecur").onclick = () => {
@@ -524,6 +705,7 @@ function options() {
     forced: forced.slice(), excluded: excluded.slice(),
     offKinds: Net.KINDS.filter((k, i) => { const e = $("kind" + i); return e && !e.checked; }),
     enemies: enemies.map((e) => ({ type: e.type, x: e.x, y: e.y })),
+    mask: scanR && scanR.runs.length ? { key: scanR.key, runs: scanR.runs } : null,
     variants: Math.max(1, Math.min(16, Math.round(num("variants", 4)))),
     improveMs: Math.max(0, Math.round(num("secs", 30) * 1000)),
     emptyWeight: Math.max(0, num("ew", 1.5) - 1),
@@ -533,7 +715,7 @@ function options() {
 }
 const kph = (n) => Math.round(n * Net.NODE_RATE / 1000) + "k";
 function refreshAll() {
-  enMask = enemies.length ? enemyMask() : null;
+  enMask = enemies.length || scanR ? enemyMask() : null;
   terrCache.ref = null;
   const o = options();
   const T = Net.targetsOf(o);
@@ -546,7 +728,7 @@ function refreshAll() {
   $("outlist").innerHTML = forced.map((p) => line(p, "f")).join("") + excluded.map((p) => line(p, "x")).join("") || '<div class="msg" style="margin:0">None.</div>';
   for (const b of $("outlist").querySelectorAll("button")) b.onclick = () => { const k = b.dataset.k; if (b.dataset.s === "f") forced = forced.filter((p) => key(p) !== k); else excluded = excluded.filter((p) => key(p) !== k); changed(); };
   const nb = enemies.filter((e) => e.type === "banner").length, nh = enemies.length - nb;
-  $("enmsg").textContent = enemies.length ? nb + " enemy banner(s), " + nh + " enemy HQ(s)" + (enemies.some((e) => e.src === "csv") ? " (" + enemies.filter((e) => e.src === "csv").length + " from the CSV)" : "") + "." : "None.";
+  $("enmsg").textContent = (scanR ? "Scan: " + scanR.tiles + " enemy tiles" + (scanR.unseenCounted ? " + " + scanR.unseenCounted + " unseen" : "") + ". " : "") + (enemies.length ? nb + " enemy banner(s), " + nh + " enemy HQ(s)" + (enemies.some((e) => e.src === "csv") ? " (" + enemies.filter((e) => e.src === "csv").length + " from the CSV)" : "") + "." : (scanR ? "No banners or HQs marked." : "None."));
   const why = hq ? Net.hqProblem(world, hq[0], hq[1]) : "no HQ yet";
   $("hqmsg").innerHTML = hq ? "HQ " + key(hq) + " (" + zoneAt(hq[0], hq[1]) + ")." + (why ? ' <span class="warn">' + why + "</span>" : "") : MODE_HELP.hq;
   $("run").disabled = !world || !hq || !!why || !o.ratio[bt];
@@ -599,6 +781,7 @@ $("run").onclick = () => {
 const nodesTxt = (n) => Net.TYPES.map((t) => n[t]).join(" / ");
 /* Summary as a table; with the CSV's network scored too, side by side with it and the change. */
 function statsHtml(d, cmp) {
+  const notes = scanNotes(d.design || (d === current ? own.banners : null));
   const T = {};
   Net.TYPES.forEach((t) => { T[t] = d.targets[t]; });
   const kept = (x) => (x === current ? own.banners.length : x.kept || 0);
@@ -630,7 +813,7 @@ function statsHtml(d, cmp) {
   const body = rows.map((r) => "<tr" + (r.title ? ' title="' + r.title + '"' : "") + "><td>" + r.l + (r.ls ? '<span class="sub">' + r.ls + "</span>" : "") + "</td>" + (cmp ? cell(r, cmp) : "") + cell(r, d) + (cmp ? change(r) : "") + "</tr>").join("");
   return '<table class="stat' + (cmp ? " cmp" : "") + '">' + head + body + "</table>" +
     d.errors.map((w) => '<div class="err">' + w + "</div>").join("") +
-    (d.warnings || []).map((w) => '<div class="warn">' + w + "</div>").join("");
+    (d.warnings || []).concat(notes).map((w) => '<div class="warn">' + w + "</div>").join("");
 }
 function listResults() {
   const box = $("designs"); box.innerHTML = "";
@@ -674,10 +857,10 @@ $("dl").onclick = () => {
 
 // ---------------------------------------------------------------- state kept between visits (this browser only)
 const STATE = "ksplanner-net-state";
-const fields = () => [...document.querySelectorAll("#side input[id], #side select[id], #side textarea[id]:not([readonly])")].filter((e) => e.id !== "showcur");
+const fields = () => [...document.querySelectorAll("#side input[id], #side select[id], #side textarea[id]:not([readonly])")].filter((e) => e.id !== "showcur" && e.type !== "file");
 function saveState() {
   try {
-    const v = { hq, own, forced, excluded, enemies, mode, view: { cu: view.cu, cv: view.cv, s: view.s } };
+    const v = { hq, own, forced, excluded, enemies, mode, pieceOn, view: { cu: view.cu, cv: view.cv, s: view.s } };
     for (const e of fields()) v["f:" + e.id] = e.type === "checkbox" ? e.checked : e.value;
     localStorage.setItem(STATE, JSON.stringify(v));
   } catch (e) {}
@@ -685,10 +868,19 @@ function saveState() {
 function loadState() {
   try {
     const v = JSON.parse(localStorage.getItem(STATE) || "null");
-    if (!v) { setMode("view"); return; }
+    if (!v) { scanList(); setMode("view"); return; }
     for (const e of fields()) if ("f:" + e.id in v) { if (e.type === "checkbox") e.checked = !!v["f:" + e.id]; else e.value = v["f:" + e.id]; }
     hq = v.hq || null; own = v.own || own; forced = v.forced || []; excluded = v.excluded || []; enemies = v.enemies || [];
     if (hq) { $("hx").value = hq[0]; $("hy").value = hq[1]; }
+    try {
+      const m = JSON.parse(localStorage.getItem(MASK_STORE) || "null");
+      if (m && m.format === "ksplanner-territory-mask") {
+        scan = m;
+        pieceOn = Array.isArray(v.pieceOn) && v.pieceOn.length === m.pieces.length ? v.pieceOn : m.pieces.map(() => null);
+        buildScan();
+      }
+    } catch (e) { console.warn("[scan mask] could not restore: " + e.message); }
+    scanList();
     setMode(v.mode || "view");
   } catch (e) { setMode("view"); }
 }
