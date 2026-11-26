@@ -175,7 +175,7 @@
       world, P, hx, hy, goals: G.goals, warnings: G.warnings,
       // banners the alliance already has: cheaper to keep (opts.existingCost, in banners)
       existing: new Set((opts.existing || []).map(([x, y]) => y * MAP + x)),
-      exCost: opts.existingCost != null ? opts.existingCost : 1,
+      exCost: opts.existingCost != null ? opts.existingCost : PRIO.existing,
       cov: new Uint16Array(MAP * MAP),       // how many squares (HQ + banners) cover each tile
       occ: new Uint8Array(MAP * MAP),        // HQ and banner tiles
       bid: new Int32Array(MAP * MAP).fill(-1),
@@ -311,20 +311,22 @@
     // costing what it costs (opts.existingCost on a tile where the alliance already has one, else 1);
     // relaxed hop by hop with a 15x15 box minimum (near outpost zones, the real links instead)
     const n = W * H, INF = 1e9;
-    const g = new Float32Array(n).fill(INF), cst = new Float32Array(n);
+    const g = new Float64Array(n).fill(INF), cst = new Float64Array(n);
     const zoneNear = new Uint8Array(n);
+    let cheapAny = false;
     for (let i = 0; i < n; i++) {
       if (!lvl[i]) continue;
       const gx = x0 + (i % W), gy = y0 + ((i / W) | 0);
       cst[i] = Math.max(0.01, bCost(st, gx, gy));
+      // a tile with a banner already built is cheaper, however little
+      if (cst[i] < 1) cheapAny = true;
       if (nearZone(st, gx, gy)) zoneNear[i] = 1;
       if (lvl[i] === 1) g[i] = cst[i];
     }
     // without a cheaper tile in the box every banner costs 1: the cost is the hop level
-    let cheap = false;
-    for (let i = 0; i < n && !cheap; i++) if (lvl[i] && cst[i] < 1) cheap = true;
+    const cheap = cheapAny;
     if (!cheap) for (let i = 0; i < n; i++) if (lvl[i]) g[i] = lvl[i];
-    const m = new Float32Array(n);
+    const m = new Float64Array(n);
     for (let it = 0; cheap && it < depth + 4; it++) {
       boxMin(g, m, W, H, 7);
       let changed = false;
@@ -358,8 +360,8 @@
   function boxMin(a, out, W, H, r) {
     const k = 2 * r + 1, INF = 1e9;
     const len = Math.max(W, H) + 2 * r + k;
-    const buf = new Float32Array(len), pre = new Float32Array(len), suf = new Float32Array(len);
-    const tmp = new Float32Array(W * H);
+    const buf = new Float64Array(len), pre = new Float64Array(len), suf = new Float64Array(len);
+    const tmp = new Float64Array(W * H);
     const pass = (get, set, count, lines) => {
       for (let l = 0; l < lines; l++) {
         const L = count + 2 * r;
@@ -398,7 +400,7 @@
       for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
         const qx = cx + dx, qy = cy + dy;
         const gq = F.g(qx, qy);
-        if (gq >= gc - 1e-6 || gq > bestG + 1e-6) continue;
+        if (gq >= gc - 1e-3 || gq > bestG + 1e-6) continue;
         if (!linkB(st, qx, qy, cx, cy)) continue;
         // value of the nodes this square completes, given the path so far
         let v = 0;
@@ -406,7 +408,7 @@
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, 1, l2);
         for (const e of l2) v += e >= 0 ? val(st.P.nodes[e]) : 0;
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, -1, null);
-        v += -F.at(qx, qy) * 1e-4 + rand() * 1e-5;
+        v += -F.at(qx, qy) * 1e-4 + (F.c(qx, qy) < 1 ? 5e-5 : 0) + rand() * 1e-5;
         if (gq < bestG - 1e-6 || v > bestV) { bestG = Math.min(bestG, gq); bestV = v; best = [qx, qy]; }
       }
       if (!best) break;
@@ -683,9 +685,13 @@
   function bCost(st, x, y) { return st.existing.has(y * MAP + x) ? st.exCost : 1; }
   function pathCost(st, path) { let c = 0; for (const [x, y] of path) c += bCost(st, x, y); return c; }
 
-  const emptyW = (opts) => (opts.emptyWeight != null ? opts.emptyWeight : 0.5);
-  // a node above a type's minimum is a bonus worth this many banners (0 = worthless)
-  const surplusV = (opts) => (opts.surplusValue != null ? opts.surplusValue : 0.5);
+  /* Strict priorities (Pedro, 26 Nov), as default weights so small they only break ties, each
+     level below the one before it: (1) fewer banners; (2) fewer empty banners (1e-3 each, at most
+     ~0.3 in all); (3) more nodes above the minimum (2e-6 each); (4) more banners already built kept
+     (existingCost 1 - 5e-9). Callers can still pass their own weights. */
+  const PRIO = { empty: 1e-3, surplus: 2e-6, existing: 1 - 5e-9 };
+  const emptyW = (opts) => (opts.emptyWeight != null ? opts.emptyWeight : PRIO.empty);
+  const surplusV = (opts) => (opts.surplusValue != null ? opts.surplusValue : PRIO.surplus);
   function surplusOf(st, T) { let s = 0; for (let t = 0; t < 4; t++) s += Math.max(0, st.count[t] - T[t]); return s; }
 
   /* Cost of a network: banners (the ones already built count opts.existingCost), plus emptyWeight

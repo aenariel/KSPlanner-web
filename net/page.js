@@ -770,9 +770,9 @@ function options() {
     mask: scanR && scanR.runs.length ? { key: scanR.key, runs: scanR.runs } : null,
     variants: Math.max(1, Math.min(16, Math.round(num("variants", 4)))),
     improveTries: Math.max(0, Math.round(num("tries", 600))),
-    emptyWeight: Math.max(0, num("ew", 1.5) - 1),
-    existing: own.banners.slice(), existingCost: Math.max(0, Math.min(1, num("exc", 0.5))),
-    surplusValue: Math.max(0, num("sv", 0.5)), verbose: true,
+    // strict priorities (net.js defaults): fewer banners, then fewer empty, then more nodes above
+    // the minimum, then more of the current network's banners kept
+    existing: own.banners.slice(), existingCost: Math.max(0, Math.min(1, num("exc", 0.8))), verbose: true,
     maxBanners: Math.max(20, Math.min(285, Math.round(num("cap", 285)))),
   };
 }
