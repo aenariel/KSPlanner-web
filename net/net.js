@@ -897,10 +897,10 @@
     let best = { cost, banners: snapshot(st) };
     const seen = new Set([sigOf()]);
     const maxSide = opts.sidewaysSteps != null ? opts.sidewaysSteps : 25;
-    const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0, spread: 0 };
+    const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0, spread: 0, restoreTries: 0, restored: 0 };
     let lastSpread = new Set(st.banners.map(([x, y]) => y * MAP + x));
     let side = 0;
-    const out = typeof budget === "object" ? () => stats.tries + stats.addTries >= budget.tries : () => Date.now() - t0 > budget;
+    const out = typeof budget === "object" ? () => stats.tries + stats.addTries + stats.restoreTries >= budget.tries : () => Date.now() - t0 > budget;
     // keep the state as it is now? (cost already checked: no errors)
     const accept = (nc) => {
       if (nc < cost - 1e-9) return "gain";
@@ -939,6 +939,8 @@
       }
       // move 2: one banner more where it completes nodes, then prune
       if (!out() && addMove()) changed = true;
+      // move 3: put back banners of the current network that went down (a new one may then go)
+      if (!out() && restoreExisting(st, opts, out, (nc) => { const k = accept(nc); if (k) { took(k, nc); stats.restored++; } return !!k; }, stats)) changed = true;
       // move 3: new banners near what changed this round spread out (less overlap, more nodes within
       // reach of one more banner), never at a cost; the next round's moves can use what that opens
       if (!out() && opts.spread !== false && opts.spreadInSearch) {
@@ -959,8 +961,42 @@
     if (best.cost < cost - 1e-9) resetTo(st, best.banners);
     const ms = Date.now() - t0;
     log("pass 3: " + stats.rounds + " round(s), " + stats.tries + " arm tries (" + stats.gains + " gains, " + stats.sideways + " neutral steps), " +
-      stats.addTries + " one-more tries (" + stats.adds + " kept), " + stats.spread + " banners spread, best cost " + best.cost.toFixed(2) + ", " + ms + " ms");
-    return { tries: stats.tries + stats.addTries, gains: stats.gains, sideways: stats.sideways, adds: stats.adds, spread: stats.spread, ms };
+      stats.addTries + " one-more tries (" + stats.adds + " kept), " + stats.restoreTries + " restore tries (" + stats.restored + " kept), " + stats.spread + " banners spread, best cost " + best.cost.toFixed(2) + ", " + ms + " ms");
+    return { tries: stats.tries + stats.addTries + stats.restoreTries, gains: stats.gains, sideways: stats.sideways, adds: stats.adds, spread: stats.spread, ms };
+  }
+
+  /* Move 3 of the local search: banners of the current network that are down (taken away by an
+     earlier step) go back, one linked group at a time, then the network is pruned (a new banner
+     doing the same job can then go); kept when keep(cost) says so. */
+  function restoreExisting(st, opts, out, keep, stats) {
+    if (!st.existing.size) return false;
+    const here = new Set(st.banners.map(([x, y]) => y * MAP + x));
+    const down = [];
+    for (const c of st.existing) if (!here.has(c) && placeable(st, c)) down.push([c % MAP, (c / MAP) | 0]);
+    if (!down.length) return false;
+    const gid = down.map(() => -1), groups = [];
+    for (let i = 0; i < down.length; i++) {
+      if (gid[i] >= 0) continue;
+      const list = [i]; gid[i] = groups.length;
+      for (let k = 0; k < list.length; k++) for (let j = 0; j < down.length; j++) {
+        if (gid[j] < 0 && linkB(st, down[list[k]][0], down[list[k]][1], down[j][0], down[j][1])) { gid[j] = groups.length; list.push(j); }
+      }
+      groups.push(list.map((q) => down[q]));
+    }
+    let any = false;
+    for (const g of groups) {
+      if (out()) break;
+      if (!g.some(([x, y]) => linksHQ(st, x, y) || st.banners.some(([bx, by]) => linkB(st, bx, by, x, y)))) continue;
+      stats.restoreTries++;
+      const before = snapshot(st);
+      for (const [x, y] of g) if (placeable(st, y * MAP + x)) addBanner(st, x, y, null);
+      prune(st, opts);
+      const c = check(st, opts);
+      const nc = c.errors.length ? null : costOf(st, c.A, opts);
+      if (nc != null && keep(nc)) any = true;
+      else resetTo(st, before);
+    }
+    return any;
   }
 
   /* Move 2 of the local search: every free tile one link away from the network whose square
@@ -1285,6 +1321,11 @@
       shiftEmpties(st, opts);
       log("variant " + v + ": pass 3 " + r.tries + " tries, " + r.gains + " gains, " + r.sideways + " neutral, " + r.adds + " added (" + (Date.now() - t0) + " ms)");
       if (useCycles) cycles(world, st, opts, rand, tEnd, cap, (m) => log("variant " + v + ": " + m));
+    }
+    // last chance for banners already built: put back any group that lowers the cost
+    {
+      let cost = costOf(st, analyse(st), opts);
+      restoreExisting(st, opts, () => false, (nc) => { if (nc < cost - 1e-9) { cost = nc; return true; } return false; }, { restoreTries: 0 });
     }
     if (opts.spread !== false) spreadNew(st, opts);
     const s = summary(st, opts);
