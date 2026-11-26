@@ -478,12 +478,12 @@ function draw() {
   screenMode();
   drawLabels(px);
 }
-function coordAt(x, y, px) {
+function coordAt(x, y, px, col) {
   if (px < 8 * dpr()) return;
   const [a, b] = toScreen(x, y);
   g.font = Math.round(Math.min(11 * dpr(), Math.max(8 * dpr(), px * 0.32))) + "px system-ui";
   g.textAlign = "center"; g.textBaseline = "top";
-  g.fillStyle = TH().text;
+  g.fillStyle = col || TH().text;
   g.fillText(x + "," + y, a, b + 1 * dpr());
 }
 function nameAt(u, v, t, size) {
@@ -506,7 +506,10 @@ function drawLabels(px) {
   }
   if (hq) { nameAt(hq[0] + 1.5, hq[1] + 1.5, "HQ", Math.max(10 * D, Math.min(14 * D, px * 0.9))); coordAt(hq[0], hq[1], Math.max(px, 8 * D)); }
   const net = shown();
-  if (net && px >= 26 * D) for (const b of net.banners) coordAt(b[0], b[1], px);
+  // the network's banners: from one wheel step further out than the nodes' names (those go below
+  // 9 px a tile); the banners taken down: from 26 px a tile, in red
+  if (net && px >= 7 * D) for (const b of net.banners) coordAt(b[0], b[1], Math.max(px, 8 * D));
+  if (net && px >= 26 * D) for (const b of net.removed) coordAt(b[0], b[1], px, "#ff8a80");
 }
 
 /* What stands on a tile, for the line under the map. */
