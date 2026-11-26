@@ -307,48 +307,49 @@
       }
       depth++;
     }
-    // weighted: g = cheapest cost of a chain from the network to a banner on that tile, each banner
-    // costing what it costs (opts.existingCost on a tile where the alliance already has one, else 1);
-    // relaxed hop by hop with a 15x15 box minimum (near outpost zones, the real links instead)
+    // weighted: g = cost of the cheapest chain with the fewest banners from the network to a banner
+    // on that tile, a banner costing opts.existingCost where the alliance already has one, else 1.
+    // Among the chains with the fewest banners (the levels), the one through the most built banners
+    // (ex), found level by level with a 15x15 box maximum (near outpost zones, the real links).
+    // Chains with more banners but cheaper are left out: with built banners at 0.8 they would need
+    // 5 built banners per extra one.
     const n = W * H, INF = 1e9;
-    const g = new Float64Array(n).fill(INF), cst = new Float64Array(n);
-    const zoneNear = new Uint8Array(n);
-    let cheapAny = false;
+    const g = new Float64Array(n).fill(INF), cst = new Float64Array(n), ex = new Int16Array(n);
+    const disc = 1 - Math.min(1, Math.max(0, st.exCost));
+    let cheap = false;
     for (let i = 0; i < n; i++) {
       if (!lvl[i]) continue;
-      const gx = x0 + (i % W), gy = y0 + ((i / W) | 0);
-      cst[i] = Math.max(0.01, bCost(st, gx, gy));
-      // a tile with a banner already built is cheaper, however little
-      if (cst[i] < 1) cheapAny = true;
-      if (nearZone(st, gx, gy)) zoneNear[i] = 1;
-      if (lvl[i] === 1) g[i] = cst[i];
+      const c = bCost(st, x0 + (i % W), y0 + ((i / W) | 0));
+      cst[i] = c;
+      if (c < 1) { cheap = true; if (lvl[i] === 1) ex[i] = 1; }
     }
-    // without a cheaper tile in the box every banner costs 1: the cost is the hop level
-    const cheap = cheapAny;
-    if (!cheap) for (let i = 0; i < n; i++) if (lvl[i]) g[i] = lvl[i];
-    const m = new Float64Array(n);
-    for (let it = 0; cheap && it < depth + 4; it++) {
-      boxMin(g, m, W, H, 7);
-      let changed = false;
-      for (let i = 0; i < n; i++) {
-        if (!lvl[i] || lvl[i] === 1) continue;
-        let best = m[i];
-        if (zoneNear[i]) {
-          // near a zone the box is only a hint: real links to tiles with a known cost
-          best = INF;
-          const x = i % W, y = (i / W) | 0, gx = x0 + x, gy = y0 + y;
-          for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
-            const qx = x + dx, qy = y + dy;
-            if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
-            const q = g[qy * W + qx];
-            if (q < best && linkB(st, gx + dx, gy + dy, gx, gy)) best = q;
+    if (cheap && disc > 0) {
+      const a = new Float64Array(n), m = new Float64Array(n), ws = boxMinWork(W, H, 7);
+      for (let l = 2; l <= depth; l++) {
+        let any = false;
+        for (let i = 0; i < n; i++) { if (lvl[i] === l - 1) { a[i] = -ex[i]; any = true; } else a[i] = INF; }
+        if (!any) break;
+        boxMin(a, m, W, H, 7, ws);
+        for (let i = 0; i < n; i++) {
+          if (lvl[i] !== l) continue;
+          let best = m[i] >= INF ? 0 : -m[i];
+          const gx = x0 + (i % W), gy = y0 + ((i / W) | 0);
+          if (nearZone(st, gx, gy)) {
+            // the box is only a hint here: the predecessors that really link
+            best = 0;
+            const x = i % W, y = (i / W) | 0;
+            for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
+              const qx = x + dx, qy = y + dy;
+              if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+              const q = qy * W + qx;
+              if (lvl[q] === l - 1 && ex[q] > best && linkB(st, gx + dx, gy + dy, gx, gy)) best = ex[q];
+            }
           }
+          ex[i] = (cst[i] < 1 ? 1 : 0) + best;
         }
-        const c = cst[i] + best;
-        if (c < g[i] - 1e-6) { g[i] = c; changed = true; }
       }
-      if (!changed) break;
     }
+    for (let i = 0; i < n; i++) if (lvl[i]) g[i] = lvl[i] - disc * ex[i];
     const idx = (x, y) => ((x < x0 || y < y0 || x >= x0 + W || y >= y0 + H) ? -1 : (y - y0) * W + x - x0);
     return { x0, y0, W, H, lvl, depth,
       at(x, y) { const i = idx(x, y); return i < 0 ? 0 : lvl[i]; },
@@ -356,23 +357,31 @@
       c(x, y) { const i = idx(x, y); return i < 0 ? 1 : cst[i]; } };
   }
 
-  /* out[i] = min of a over the (2r+1)x(2r+1) box around i (van Herk / Gil-Werman, rows then columns). */
-  function boxMin(a, out, W, H, r) {
-    const k = 2 * r + 1, INF = 1e9;
-    const len = Math.max(W, H) + 2 * r + k;
-    const buf = new Float64Array(len), pre = new Float64Array(len), suf = new Float64Array(len);
-    const tmp = new Float64Array(W * H);
-    const pass = (get, set, count, lines) => {
-      for (let l = 0; l < lines; l++) {
-        const L = count + 2 * r;
-        for (let j = 0; j < L; j++) { const s = j - r; buf[j] = s < 0 || s >= count ? INF : get(l, s); }
-        for (let j = 0; j < L; j++) pre[j] = j % k === 0 ? buf[j] : Math.min(pre[j - 1], buf[j]);
-        for (let j = L - 1; j >= 0; j--) suf[j] = (j % k === k - 1 || j === L - 1) ? buf[j] : Math.min(suf[j + 1], buf[j]);
-        for (let s = 0; s < count; s++) { const j = s + r; set(l, s, Math.min(suf[j - r], pre[Math.min(L - 1, j + r)])); }
-      }
-    };
-    pass((y, x) => a[y * W + x], (y, x, v) => { tmp[y * W + x] = v; }, W, H);
-    pass((x, y) => tmp[y * W + x], (x, y, v) => { out[y * W + x] = v; }, H, W);
+  /* out[i] = min of a over the (2r+1)x(2r+1) box around i (van Herk / Gil-Werman, rows then
+     columns, no allocation: ws holds the work arrays, from boxMinWork). */
+  function boxMinWork(W, H, r) {
+    const len = Math.max(W, H) + 2 * r + 2;
+    return { tmp: new Float64Array(W * H), buf: new Float64Array(len), pre: new Float64Array(len), suf: new Float64Array(len) };
+  }
+  function boxMin(a, out, W, H, r, ws) {
+    ws = ws || boxMinWork(W, H, r);
+    const k = 2 * r + 1, INF = 1e9, { tmp, buf, pre, suf } = ws;
+    // rows: a -> tmp
+    for (let y = 0; y < H; y++) {
+      const base = y * W, L = W + 2 * r;
+      for (let j = 0; j < L; j++) { const x = j - r; buf[j] = x < 0 || x >= W ? INF : a[base + x]; }
+      for (let j = 0; j < L; j++) pre[j] = j % k === 0 ? buf[j] : (pre[j - 1] < buf[j] ? pre[j - 1] : buf[j]);
+      for (let j = L - 1; j >= 0; j--) suf[j] = (j % k === k - 1 || j === L - 1) ? buf[j] : (suf[j + 1] < buf[j] ? suf[j + 1] : buf[j]);
+      for (let x = 0; x < W; x++) { const p = pre[Math.min(L - 1, x + 2 * r)], q = suf[x]; tmp[base + x] = p < q ? p : q; }
+    }
+    // columns: tmp -> out
+    for (let x = 0; x < W; x++) {
+      const L = H + 2 * r;
+      for (let j = 0; j < L; j++) { const y = j - r; buf[j] = y < 0 || y >= H ? INF : tmp[y * W + x]; }
+      for (let j = 0; j < L; j++) pre[j] = j % k === 0 ? buf[j] : (pre[j - 1] < buf[j] ? pre[j - 1] : buf[j]);
+      for (let j = L - 1; j >= 0; j--) suf[j] = (j % k === k - 1 || j === L - 1) ? buf[j] : (suf[j + 1] < buf[j] ? suf[j + 1] : buf[j]);
+      for (let y = 0; y < H; y++) { const p = pre[Math.min(L - 1, y + 2 * r)], q = suf[y]; out[y * W + x] = p < q ? p : q; }
+    }
   }
 
   // ---------------------------------------------------------------- gains and paths
@@ -975,7 +984,8 @@
     const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0, spread: 0, restoreTries: 0, restored: 0 };
     let lastSpread = new Set(st.banners.map(([x, y]) => y * MAP + x));
     let side = 0;
-    const out = typeof budget === "object" ? () => stats.tries + stats.addTries + stats.restoreTries >= budget.tries : () => Date.now() - t0 > budget;
+    const outRaw = typeof budget === "object" ? () => stats.tries + stats.addTries + stats.restoreTries >= budget.tries : () => Date.now() - t0 > budget;
+    const out = () => { report(); return outRaw(); };
     // keep the state as it is now? (cost already checked: no errors)
     const accept = (nc) => {
       if (nc < cost - 1e-9) return "gain";
@@ -988,6 +998,10 @@
       if (cost < best.cost - 1e-9) best = { cost, banners: snapshot(st) };
     };
     const evalNow = () => { const c = check(st, opts); return c.errors.length ? null : costOf(st, c.A, opts); };
+    // progress for the page: tries done so far (every 25)
+    let lastReport = 0;
+    function report() { reportNow(); }
+    const reportNow = () => { const t = stats.tries + stats.addTries + stats.restoreTries; if (opts.onTries && t - lastReport >= 25) { lastReport = t; opts.onTries(t); } };
     for (let changed = true; changed && !out();) {
       changed = false; stats.rounds++;
       // move 1: an arm away, re-linked locally (move 2 also runs every 40 tries: a round can take
@@ -999,6 +1013,7 @@
         if (++sinceAdd >= 40) { sinceAdd = 0; if (addMove()) changed = true; if (out()) break; }
         if (i >= st.banners.length) continue;
         stats.tries++;
+        report();
         const before = snapshot(st);
         const gone = new Set(before.map(([x, y]) => y * MAP + x));
         removeBannerAt(st, i);

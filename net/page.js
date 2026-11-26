@@ -815,19 +815,25 @@ $("run").onclick = () => {
   $("run").disabled = true; $("prog").style.width = "0";
   const t0 = Date.now();
   let workers = 1, done = 0;
-  // about 0.05 s a try on a PC (slower with a scan mask or on a phone), plus ~5 s to build
-  const estimate = () => Math.ceil(opts.variants / workers) * (opts.improveTries * 0.05 * (opts.mask ? 2 : 1) + 5);
+  // progress from the tries the variants report (every 25); the remaining time from the real pace
+  const triesOf = {}, finished = new Set(), T = Math.max(1, opts.improveTries);
   const tick = () => {
-    const el = (Date.now() - t0) / 1000, est = estimate();
-    $("prog").style.width = Math.min(98, Math.round(el / est * 100)) + "%";
-    $("runmsg").textContent = done + " of " + opts.variants + " variants done · " + Math.round(el) + " s of about " + Math.round(est) + " s (" + workers + (workers > 1 ? " workers side by side)" : " worker)");
+    const el = (Date.now() - t0) / 1000;
+    let doneT = finished.size * T;
+    for (const v in triesOf) if (!finished.has(+v)) doneT += Math.min(T, triesOf[v]);
+    const frac = doneT / (opts.variants * T);
+    $("prog").style.width = Math.min(99, Math.round(frac * 100)) + "%";
+    const left = frac > 0.02 ? Math.round(el / frac - el) : null;
+    $("runmsg").textContent = done + " of " + opts.variants + " variants done · " + Math.round(frac * 100) + "% of the tries · " + Math.round(el) + " s" +
+      (left != null ? ", about " + left + " s left" : "") + " (" + workers + (workers > 1 ? " workers side by side)" : " worker)");
   };
   timer = setInterval(tick, 500);
   $("runmsg").textContent = "Starting…";
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.type === "start") { workers = m.workers; tick(); }
-    else if (m.type === "progress") { done = m.done; tick(); }
+    else if (m.type === "progress") { done = m.done; if (m.v != null) finished.add(m.v); tick(); }
+    else if (m.type === "tries") { triesOf[m.v] = m.n; }
     else if (m.type === "current") { current = m.current; showCurrent(); }
     else if (m.type === "done") {
       clearInterval(timer); timer = null;
@@ -1005,6 +1011,20 @@ function loadState() {
 }
 document.getElementById("side").addEventListener("input", saveState);
 document.getElementById("side").addEventListener("change", saveState);
+
+// cards open or closed as the user left them (this browser only), by their title
+const CARDS = "ksplanner-net-cards";
+(function () {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(CARDS) || "{}"); } catch (e) {}
+  for (const d of document.querySelectorAll("details.sec")) {
+    const k = d.querySelector("summary").textContent.trim();
+    if (k in saved) d.open = !!saved[k];
+    d.addEventListener("toggle", () => {
+      try { const v = JSON.parse(localStorage.getItem(CARDS) || "{}"); v[k] = d.open; localStorage.setItem(CARDS, JSON.stringify(v)); } catch (e) {}
+    });
+  }
+})();
 
 window.addEventListener("resize", resize);
 resize();

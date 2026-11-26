@@ -24,7 +24,8 @@ self.onmessage = async (e) => {
   if (m.kind === "variant") {
     try {
       await load();
-      self.postMessage({ id: m.id, res: Net.runVariant(world, m.hx, m.hy, m.opts, m.v) });
+      const o = Object.assign({}, m.opts, { onTries: (n) => self.postMessage({ id: m.id, tries: n }) });
+      self.postMessage({ id: m.id, res: Net.runVariant(world, m.hx, m.hy, o, m.v) });
     } catch (err) {
       self.postMessage({ id: m.id, error: errText(err) });
     }
@@ -63,20 +64,28 @@ self.onmessage = async (e) => {
     if (helpers.length < 2) size = 1;
     self.postMessage({ type: "start", workers: size });
     const results = [];
-    const done = () => self.postMessage({ type: "progress", done: results.length, of: n, ms: Date.now() - t0 });
+    const done = (v) => self.postMessage({ type: "progress", done: results.length, of: n, v, ms: Date.now() - t0 });
     if (size === 1) {
-      for (let v = 0; v < n; v++) { results.push(Net.runVariant(world, hx, hy, opts, v)); done(); }
+      for (let v = 0; v < n; v++) {
+        const o = Object.assign({}, opts, { onTries: (t) => self.postMessage({ type: "tries", v, n: t }) });
+        results.push(Net.runVariant(world, hx, hy, o, v)); done(v);
+      }
     } else {
       let next = 0, seq = 0;
       const call = (w, v) => new Promise((res, rej) => {
         const id = ++seq;
-        const h = (ev) => { if (ev.data && ev.data.id === id) { w.removeEventListener("message", h); ev.data.error ? rej(new Error(ev.data.error)) : res(ev.data.res); } };
+        const h = (ev) => {
+          if (!ev.data || ev.data.id !== id) return;
+          // progress from the helper: tries done in this variant
+          if (ev.data.tries != null) { self.postMessage({ type: "tries", v, n: ev.data.tries }); return; }
+          w.removeEventListener("message", h); ev.data.error ? rej(new Error(ev.data.error)) : res(ev.data.res);
+        };
         w.addEventListener("message", h);
         w.addEventListener("error", (ev) => rej(new Error(ev.message || "helper worker failed")), { once: true });
         w.postMessage({ kind: "variant", id, hx, hy, opts, v });
       });
       await Promise.all(helpers.map(async (w) => {
-        while (next < n) { const v = next++; results.push(await call(w, v)); done(); }
+        while (next < n) { const v = next++; results.push(await call(w, v)); done(v); }
       }));
     }
     self.postMessage({ type: "done", results: Net.rank(results), repair, workers: size, ms: Date.now() - t0 });

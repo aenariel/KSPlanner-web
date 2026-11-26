@@ -79,8 +79,20 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.26.5</div>
+    <div class="msg" id="version">Version 2026.11.26.6</div>
     <div class="msg" id="loadmsg">Loading map…</div>
+
+    <details class="sec" open><summary>Click on the map</summary>
+    <div class="modes">
+      <button id="m-view" data-mode="view">Move only</button>
+      <button id="m-hq" data-mode="hq">HQ</button>
+      <button id="m-out" data-mode="outpost">Outposts</button>
+      <button id="m-eb" data-mode="ebanner">Enemy banner</button>
+      <button id="m-eh" data-mode="ehq">Enemy HQ</button>
+      <button id="m-piece" data-mode="piece">Scan piece</button>
+    </div>
+    <div class="msg" id="modehelp"></div>
+    </details>
 
     <details class="sec" open><summary>Your alliance</summary>
     <div class="msg">Paste a KSMapper CSV (optional): its Badland HQ is used, its banners are shown as the current network, and banners and HQs of other tags become enemy territory.</div>
@@ -105,17 +117,6 @@
       <label class="check"><input id="showcur" type="checkbox"> Show it on the map on its own, instead of the result</label></details>
     </div>
 
-    <details class="sec" open><summary>Click on the map</summary>
-    <div class="modes">
-      <button id="m-view" data-mode="view">Move only</button>
-      <button id="m-hq" data-mode="hq">HQ</button>
-      <button id="m-out" data-mode="outpost">Outposts</button>
-      <button id="m-eb" data-mode="ebanner">Enemy banner</button>
-      <button id="m-eh" data-mode="ehq">Enemy HQ</button>
-      <button id="m-piece" data-mode="piece">Scan piece</button>
-    </div>
-    <div class="msg" id="modehelp"></div>
-    </details>
 
     <details class="sec" open><summary>Resource targets</summary>
     <div class="row ratio">Ratio <input id="rb" type="number" value="3" min="0" max="20" title="bread">:<input id="rw" type="number" value="3" min="0" max="20" title="wood">:<input id="rs" type="number" value="2" min="0" max="20" title="stone">:<input id="ri" type="number" value="1" min="0" max="20" title="iron"></div>
@@ -135,7 +136,7 @@
     <div class="msg" id="outmsg"></div>
     </details>
 
-    <details class="sec" open><summary>Enemy territory (scan)</summary>
+    <details class="sec"><summary>Enemy territory (scan)</summary>
     <div class="msg">Load the <code>territory_mask.json</code> of a territory scan: every other alliance's ground tile by tile, so your banners can pass diagonally between enemy squares that only touch at a corner. Pieces with your alliance tag are left out; click one in the list (or pick "Scan piece" and click the map) to switch it on or off.</div>
     <div class="row"><input id="maskfile" type="file" accept=".json,application/json" style="width:100%"></div>
     <label>Unseen tiles <select id="unseenMode" style="width:150px"><option value="enemy">are enemy ground</option><option value="touch" selected>enemy if they touch an enemy</option><option value="free">are free</option></select></label>
@@ -151,10 +152,10 @@
     <div class="row"><button id="clearen">Clear enemies</button></div>
     </details>
 
-    <details class="sec"><summary>Search</summary>
+    <details class="sec" open><summary>Search</summary>
     <label>Variants <input id="variants" type="number" value="4" min="1" max="16"></label>
     <label>Search tries per variant <input id="tries" type="number" value="600" min="0" max="20000" step="100"></label>
-    <div class="msg">A fixed number of tries, so the same settings give the same networks on any machine. About 0.05 s a try on a PC (600 ≈ 30 s), slower with a scan mask or on a phone.</div>
+    <div class="msg">A fixed number of tries, so the same settings give the same networks on any machine. About 0.05 s a try on a PC without a pasted network (600 ≈ 30 s); with your network, a scan mask or on a phone, several times slower. The bar shows the tries done.</div>
     <label>A banner you already have costs (banners) <input id="exc" type="number" value="0.8" min="0" max="1" step="0.05"></label>
     <div class="msg">Networks are compared in a strict order: (1) fewer banners, where each banner of the pasted network that stays counts this much instead of 1 (0.8: taking 5 of yours down must save at least 1 banner); (2) then fewer empty banners; (3) then more resource nodes above the minimum; (4) then more of your banners kept. The minimums are always met. A later point never makes up for an earlier one.</div>
     <label>Banner limit <input id="cap" type="number" value="285" min="20" max="285"></label>
