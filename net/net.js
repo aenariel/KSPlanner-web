@@ -307,8 +307,70 @@
       }
       depth++;
     }
+    // weighted: g = cheapest cost of a chain from the network to a banner on that tile, each banner
+    // costing what it costs (opts.existingCost on a tile where the alliance already has one, else 1);
+    // relaxed hop by hop with a 15x15 box minimum (near outpost zones, the real links instead)
+    const n = W * H, INF = 1e9;
+    const g = new Float32Array(n).fill(INF), cst = new Float32Array(n);
+    const zoneNear = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (!lvl[i]) continue;
+      const gx = x0 + (i % W), gy = y0 + ((i / W) | 0);
+      cst[i] = Math.max(0.01, bCost(st, gx, gy));
+      if (nearZone(st, gx, gy)) zoneNear[i] = 1;
+      if (lvl[i] === 1) g[i] = cst[i];
+    }
+    // without a cheaper tile in the box every banner costs 1: the cost is the hop level
+    let cheap = false;
+    for (let i = 0; i < n && !cheap; i++) if (lvl[i] && cst[i] < 1) cheap = true;
+    if (!cheap) for (let i = 0; i < n; i++) if (lvl[i]) g[i] = lvl[i];
+    const m = new Float32Array(n);
+    for (let it = 0; cheap && it < depth + 4; it++) {
+      boxMin(g, m, W, H, 7);
+      let changed = false;
+      for (let i = 0; i < n; i++) {
+        if (!lvl[i] || lvl[i] === 1) continue;
+        let best = m[i];
+        if (zoneNear[i]) {
+          // near a zone the box is only a hint: real links to tiles with a known cost
+          best = INF;
+          const x = i % W, y = (i / W) | 0, gx = x0 + x, gy = y0 + y;
+          for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
+            const qx = x + dx, qy = y + dy;
+            if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+            const q = g[qy * W + qx];
+            if (q < best && linkB(st, gx + dx, gy + dy, gx, gy)) best = q;
+          }
+        }
+        const c = cst[i] + best;
+        if (c < g[i] - 1e-6) { g[i] = c; changed = true; }
+      }
+      if (!changed) break;
+    }
+    const idx = (x, y) => ((x < x0 || y < y0 || x >= x0 + W || y >= y0 + H) ? -1 : (y - y0) * W + x - x0);
     return { x0, y0, W, H, lvl, depth,
-      at(x, y) { return (x < x0 || y < y0 || x >= x0 + W || y >= y0 + H) ? 0 : lvl[(y - y0) * W + x - x0]; } };
+      at(x, y) { const i = idx(x, y); return i < 0 ? 0 : lvl[i]; },
+      g(x, y) { const i = idx(x, y); return i < 0 || !lvl[i] ? INF : g[i]; },
+      c(x, y) { const i = idx(x, y); return i < 0 ? 1 : cst[i]; } };
+  }
+
+  /* out[i] = min of a over the (2r+1)x(2r+1) box around i (van Herk / Gil-Werman, rows then columns). */
+  function boxMin(a, out, W, H, r) {
+    const k = 2 * r + 1, INF = 1e9;
+    const len = Math.max(W, H) + 2 * r + k;
+    const buf = new Float32Array(len), pre = new Float32Array(len), suf = new Float32Array(len);
+    const tmp = new Float32Array(W * H);
+    const pass = (get, set, count, lines) => {
+      for (let l = 0; l < lines; l++) {
+        const L = count + 2 * r;
+        for (let j = 0; j < L; j++) { const s = j - r; buf[j] = s < 0 || s >= count ? INF : get(l, s); }
+        for (let j = 0; j < L; j++) pre[j] = j % k === 0 ? buf[j] : Math.min(pre[j - 1], buf[j]);
+        for (let j = L - 1; j >= 0; j--) suf[j] = (j % k === k - 1 || j === L - 1) ? buf[j] : Math.min(suf[j + 1], buf[j]);
+        for (let s = 0; s < count; s++) { const j = s + r; set(l, s, Math.min(suf[j - r], pre[Math.min(L - 1, j + r)])); }
+      }
+    };
+    pass((y, x) => a[y * W + x], (y, x, v) => { tmp[y * W + x] = v; }, W, H);
+    pass((x, y) => tmp[y * W + x], (x, y, v) => { out[y * W + x] = v; }, H, W);
   }
 
   // ---------------------------------------------------------------- gains and paths
@@ -322,40 +384,44 @@
     return g;
   }
 
-  /* Banner chain from the network to (x, y) through the field, each step the predecessor that
-     captures most (ties: the one nearer the network side, then seeded noise). */
+  /* Banner chain from the network to (x, y) through the field: the cheapest one (banners already
+     built cost less), and among equally cheap predecessors the one that captures most, then the
+     one nearer the network side, then seeded noise. */
   function pathTo(st, F, x, y, val, rand) {
     const path = [[x, y]];
-    let lv = F.at(x, y);
     const log = [];
     sqAdd(st, x - 3, y - 3, x + 3, y + 3, 1, log);
     let cx = x, cy = y;
-    while (lv > 1) {
-      let best = null, bestG = -1e9;
+    for (let guard = 0; F.at(cx, cy) > 1 && guard < 400; guard++) {
+      const gc = F.g(cx, cy);
+      let best = null, bestG = 1e9, bestV = -1e9;
       for (let dy = -7; dy <= 7; dy++) for (let dx = -7; dx <= 7; dx++) {
         const qx = cx + dx, qy = cy + dy;
-        if (F.at(qx, qy) !== lv - 1) continue;
+        const gq = F.g(qx, qy);
+        if (gq >= gc - 1e-6 || gq > bestG + 1e-6) continue;
         if (!linkB(st, qx, qy, cx, cy)) continue;
-        let g = 0;
         // value of the nodes this square completes, given the path so far
+        let v = 0;
         const l2 = [];
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, 1, l2);
-        for (const e of l2) g += e >= 0 ? val(st.P.nodes[e]) : 0;
+        for (const e of l2) v += e >= 0 ? val(st.P.nodes[e]) : 0;
         sqAdd(st, qx - 3, qy - 3, qx + 3, qy + 3, -1, null);
-        g += (1 - bCost(st, qx, qy)) + rand() * 1e-3;
-        if (g > bestG) { bestG = g; best = [qx, qy]; }
+        v += -F.at(qx, qy) * 1e-4 + rand() * 1e-5;
+        if (gq < bestG - 1e-6 || v > bestV) { bestG = Math.min(bestG, gq); bestV = v; best = [qx, qy]; }
       }
       if (!best) break;
       path.push(best);
       sqAdd(st, best[0] - 3, best[1] - 3, best[0] + 3, best[1] + 3, 1, log);
-      cx = best[0]; cy = best[1]; lv--;
+      cx = best[0]; cy = best[1];
     }
     for (const [px, py] of path) sqAdd(st, px - 3, py - 3, px + 3, py + 3, -1, null);
     return path.reverse();
   }
 
   // positions whose square completes node n (given the current coverage), with their level
-  function nodeSpots(st, F, n) {
+  /* Positions whose square completes node n (given the current coverage): the cheapest ones (field
+     cost), with their cost and hop level; byLevel: the ones the fewest banners away instead. */
+  function nodeSpots(st, F, n, byLevel) {
     const ns = st.P.ns;
     let mx1 = 1e9, my1 = 1e9, mx2 = -1, my2 = -1;
     for (let dy = 0; dy < ns; dy++) for (let dx = 0; dx < ns; dx++) {
@@ -369,10 +435,12 @@
     for (let y = my2 - 3; y <= my1 + 3; y++) for (let x = mx2 - 3; x <= mx1 + 3; x++) {
       const l = F.at(x, y);
       if (!l) continue;
-      if (!best || l < best) { best = l; spots.length = 0; }
-      if (l === best) spots.push([x, y]);
+      const v = byLevel ? l : F.g(x, y);
+      if (!best || v < best - 1e-6) { best = v; spots.length = 0; }
+      if (Math.abs(v - best) <= 1e-6) spots.push([x, y]);
     }
-    return best ? { lvl: best, spots } : null;
+    if (!best) return null;
+    return { lvl: byLevel ? best : F.at(spots[0][0], spots[0][1]), cost: byLevel ? F.g(spots[0][0], spots[0][1]) : best, spots };
   }
 
   // positions whose square touches outpost o's zone, with their level
@@ -392,13 +460,14 @@
         if (xx >= 0 && yy >= 0 && xx < MAP && yy < MAP && !st.P.noOwn[yy * MAP + xx]) { touches = true; break; }
       }
       if (!touches) continue;
-      if (!best || l < best) best = l;
-      all.push([x, y, l]);
+      const c = F.g(x, y);
+      if (!best || c < best) best = c;
+      all.push([x, y, c]);
     }
     if (!best) return null;
-    const spots = all.filter((p) => p[2] === best).map((p) => [p[0], p[1]]);
-    // detours: spots 1..slack levels further, for chains that pass by resources
-    const detours = slack ? all.filter((p) => p[2] > best && p[2] <= best + slack).map((p) => [p[0], p[1]]) : [];
+    // cheapest chains (banners already built cost less), and detours costing up to `slack` more
+    const spots = all.filter((p) => p[2] <= best + 1e-6).map((p) => [p[0], p[1]]);
+    const detours = slack ? all.filter((p) => p[2] > best + 1e-6 && p[2] <= best + slack + 1e-6).map((p) => [p[0], p[1]]) : [];
     return { lvl: best, spots, detours };
   }
 
@@ -508,7 +577,7 @@
         if (n.x < F.x0 || n.y < F.y0 || n.x >= F.x0 + F.W || n.y >= F.y0 + F.H) continue;
         const s = nodeSpots(st, F, n);
         if (!s) continue;
-        cands.push({ n, s, est: val(n) / s.lvl });
+        cands.push({ n, s, est: val(n) / s.cost });
       }
       if (!cands.length) break;
       cands.sort((a, b) => b.est - a.est);
@@ -784,7 +853,7 @@
     let n = 0;
     for (const nd of st.P.nodes) {
       if (st.full[nd.i] || nd.x < area[0] || nd.y < area[1] || nd.x > area[2] || nd.y > area[3]) continue;
-      const sp = nodeSpots(st, F, nd);
+      const sp = nodeSpots(st, F, nd, true);
       if (sp && sp.lvl === 1) n++;
     }
     return n;
@@ -1008,7 +1077,7 @@
     const seenSpot = new Set(), cands = [];
     for (const n of st.P.nodes) {
       if (st.full[n.i] || n.x < F.x0 || n.y < F.y0 || n.x >= F.x0 + F.W || n.y >= F.y0 + F.H) continue;
-      const s = nodeSpots(st, F, n);
+      const s = nodeSpots(st, F, n, true);
       if (!s || s.lvl !== 1) continue;
       for (const [x, y] of s.spots) {
         const c = y * MAP + x;
