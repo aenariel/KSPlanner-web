@@ -33,18 +33,26 @@ self.onmessage = async (e) => {
   if (m.kind === "evaluate") {
     try {
       await load();
-      self.postMessage({ type: "current", current: Net.evaluate(world, m.hx, m.hy, m.banners, m.opts) });
+      const t0 = Date.now();
+      const current = Net.evaluate(world, m.hx, m.hy, m.banners, m.opts);
+      // step 0 preview: what would be fixed first when the CSV's network has cut-off or misplaced banners
+      const repair = (current.cutGroups && current.cutGroups.length) || (current.onEnemy && current.onEnemy.length) ? Net.repairImport(world, m.hx, m.hy, m.banners, m.opts) : null;
+      console.log("[net] current network scored in " + (Date.now() - t0) + " ms" + (repair ? ", step 0: " + repair.fixes.length + " fix(es)" : ""));
+      self.postMessage({ type: "current", current, repair });
     } catch (err) {
       self.postMessage({ type: "error", message: errText(err) });
     }
     return;
   }
   // a whole run
-  const { hx, hy, opts } = m;
+  const { hx, hy } = m;
+  let opts = m.opts, repair = null;
   const helpers = [];
   try {
     await load();
     const t0 = Date.now();
+    // step 0: fix the pasted network's cheap errors once; every variant starts from the fixed one
+    ({ opts, repair } = Net.withRepair(world, hx, hy, opts));
     const n = opts.variants;
     const cores = (self.navigator && navigator.hardwareConcurrency) || 2;
     let size = Math.max(1, Math.min(n, 4, cores - 1));
@@ -71,7 +79,7 @@ self.onmessage = async (e) => {
         while (next < n) { const v = next++; results.push(await call(w, v)); done(); }
       }));
     }
-    self.postMessage({ type: "done", results: Net.rank(results), workers: size, ms: Date.now() - t0 });
+    self.postMessage({ type: "done", results: Net.rank(results), repair, workers: size, ms: Date.now() - t0 });
   } catch (err) {
     self.postMessage({ type: "error", message: errText(err) });
   } finally {

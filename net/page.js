@@ -5,7 +5,11 @@ const $ = (id) => document.getElementById(id);
 const M = 1200;
 let world = null, base = null, staticLabels = [], smap = null, outposts = [], zoneMask = null, nodeMask = null;
 let hq = null;                 // [x, y] lower-left tile of the Badland HQ
-let own = { tag: "", banners: [] };   // current network from the CSV
+// current network from the CSV: banners = the Badland network (scored, optimised); all = every banner of
+// the tag; plains = the ones chained only to a Plains HQ (left out with "Connect only to the Badland HQ");
+// guides = banners of ignored tags (drawn as outlines)
+let own = { tag: "", banners: [], all: [], plains: [], plainsHqs: [], guides: [] };
+let repair = null;             // step 0 on the current network: { fixes, before, after }
 let forced = [], excluded = [];       // outpost anchors [x, y]
 let enemies = [];              // { type: "banner" | "hq", x, y, src: "csv" | "map" }
 let results = [], sel = -1, current = null;
@@ -135,6 +139,8 @@ async function init() {
     loadState();
     if (hq) { view.cu = hq[0] + 1.5; view.cv = hq[1] + 1.5; view.s = 1.2; }
     refreshAll();
+    // the CSV kept from the last visit: validate it straight away
+    if (hq && own.banners && own.banners.length) evaluateCurrent();
   } catch (e) {
     $("loadmsg").innerHTML = '<span class="err">Could not load the map data: ' + e.message + "</span>";
   }
@@ -287,12 +293,19 @@ function scanList() {
     (scanR ? " in " + scanR.blocks.length + " blocks, " + (scanR.unseenCounted ? scanR.unseenCounted + " counted as enemy" : "none counted as enemy") + (scanR.unseenMine ? ", " + scanR.unseenMine + " inside your own squares (yours)" : "") : "") + "." +
     (own.tag ? "" : ' <span class="warn">Load your CSV (or type your tag) so your own pieces are left out.</span>');
 }
-function scanChanged() { buildScan(); scanList(); saveScanChoice(); refreshAll(); }
+function scanChanged() { buildScan(); resplit(); scanList(); saveScanChoice(); refreshAll(); }
+/* After the enemy ground changed: split the CSV's network again and score it again. */
+function resplit() {
+  if (!own.all || !own.all.length) return;
+  splitOwn(); buildScan();
+  results = []; sel = -1; $("results").hidden = true; current = null; repair = null;
+  evaluateCurrent();
+}
 function saveScanChoice() { try { const v = JSON.parse(localStorage.getItem(STATE) || "{}"); v.pieceOn = pieceOn; localStorage.setItem(STATE, JSON.stringify(v)); } catch (e) {} }
 function setScan(m, keepChoice) {
   scan = m;
   if (!keepChoice) pieceOn = m ? m.pieces.map(() => null) : [];
-  buildScan(); scanList(); refreshAll();
+  buildScan(); resplit(); scanList(); refreshAll();
 }
 $("maskfile").onchange = async () => {
   const f = $("maskfile").files[0];
@@ -305,7 +318,7 @@ $("maskfile").onchange = async () => {
   } catch (e) { $("maskmsg").innerHTML = '<span class="err">Could not read ' + f.name + ": " + e.message + "</span>"; }
   $("maskfile").value = "";
 };
-$("unseenMode").addEventListener("change", () => { buildScan(); scanList(); refreshAll(); });
+$("unseenMode").addEventListener("change", () => { buildScan(); resplit(); scanList(); refreshAll(); });
 $("mall").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => true); scanChanged(); } };
 $("mnone").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => false); scanChanged(); } };
 $("mown").onclick = () => { if (scan) { pieceOn = scan.pieces.map(() => null); scanChanged(); } };
@@ -436,6 +449,18 @@ function draw() {
       const empty = net.empty && net.empty[i];
       sq(x, y, net.kept[i] ? (empty ? COL.keptEmpty : COL.kept) : (empty ? COL.freshEmpty : COL.fresh));
     });
+  }
+  // ignored tags: thin outlines (a guide); your Plains network: grey, left as it is
+  if (own.guides) for (const [x, y] of own.guides) { g.strokeStyle = "rgba(220,224,230,.85)"; g.lineWidth = 1.2 * dpr() / px; g.strokeRect(x - off, y - off, sz, sz); }
+  if ($("badlandOnly").checked && own.plains && own.plains.length) {
+    for (const [x, y] of own.plains) sq(x, y, "#9aa3ad", "#4a5260");
+    for (const [x, y] of own.plainsHqs) { rect(x - 6, y - 6, 15, 15, null, "rgba(154,163,173,.9)", 2); rect(x, y, 3, 3, "#9aa3ad", "#4a5260"); }
+  }
+  // step 0 on the current network: where a banner moves (from its old tile) and the new bridges
+  if (repair && repair.fixes && net && net.isCurrent) for (const f of repair.fixes) {
+    const to = f.type === "move" ? f.to : f.at;
+    if (f.type === "move") { g.strokeStyle = "#22d3ee"; g.lineWidth = 2 * dpr() / px; g.beginPath(); g.moveTo(f.from[0] + 0.5, f.from[1] + 0.5); g.lineTo(to[0] + 0.5, to[1] + 0.5); g.stroke(); }
+    rect(to[0] - 0.6, to[1] - 0.6, 2.2, 2.2, "rgba(34,211,238,.35)", "#22d3ee", 2.5);
   }
   for (const e of enemies) if (e.type === "banner") sq(e.x, e.y, "#c0392b", "#641e16");
   for (const e of enemies) if (e.type === "hq") rect(e.x, e.y, 3, 3, "#c0392b", "#641e16");
@@ -636,37 +661,73 @@ function setHQ(x, y, centre) {
 
 // ---------------------------------------------------------------- CSV in
 $("loadcsv").onclick = () => {
-  const rows = $("csvin").value.split(/\r?\n/).map((l) => l.split(",").map((s) => s.trim())).filter((r) => r.length >= 4 && Number.isFinite(+r[1]) && Number.isFinite(+r[2]) && r[1] !== "");
+  const t0 = performance.now();
+  const ignore = new Set($("ignoreTags").value.split(/[\s,;]+/).map((t) => t.trim().toLowerCase()).filter(Boolean));
+  const all = $("csvin").value.split(/\r?\n/).map((l) => l.split(",").map((s) => s.trim())).filter((r) => r.length >= 4 && Number.isFinite(+r[1]) && Number.isFinite(+r[2]) && r[1] !== "");
+  const ignored = all.filter((r) => ignore.has(String(r[3]).toLowerCase()));
+  const rows = all.filter((r) => !ignore.has(String(r[3]).toLowerCase()));
   const inPlains = (x, y) => x >= 300 && x <= 899 && y >= 300 && y <= 899;
   let tag = $("tag").value.trim();
   if (!tag) { const h = rows.find((r) => r[0] === "hq" && !inPlains(+r[1], +r[2])); if (h) tag = h[3]; }
   if (!tag) { $("csvmsg").innerHTML = '<span class="err">No Badland HQ in the CSV: type the alliance tag.</span>'; return; }
   $("tag").value = tag;
   const h = rows.find((r) => r[0] === "hq" && r[3] === tag && !inPlains(+r[1], +r[2]));
-  own = { tag, banners: rows.filter((r) => r[0] === "banner" && r[3] === tag).map((r) => [+r[1], +r[2]]) };
+  const mineB = rows.filter((r) => r[0] === "banner" && r[3] === tag).map((r) => [+r[1], +r[2]]);
+  own = { tag, banners: mineB.slice(), all: mineB, plains: [],
+    plainsHqs: rows.filter((r) => r[0] === "hq" && r[3] === tag && inPlains(+r[1], +r[2])).map((r) => [+r[1], +r[2]]),
+    guides: ignored.filter((r) => r[0] === "banner").map((r) => [+r[1], +r[2]]) };
   enemies = enemies.filter((e) => e.src !== "csv");
   let ne = 0;
   if ($("othersEnemy").checked) for (const r of rows) {
     if ((r[0] !== "banner" && r[0] !== "hq") || r[3] === tag) continue;
     enemies.push({ type: r[0], x: +r[1], y: +r[2], src: "csv" }); ne++;
   }
-  const plainsHq = rows.some((r) => r[0] === "hq" && r[3] === tag && inPlains(+r[1], +r[2]));
-  $("csvmsg").textContent = tag + ": " + own.banners.length + " banners" + (h ? ", HQ " + h[1] + "," + h[2] : ", no Badland HQ") + (plainsHq ? " (Plains HQ left out)" : "") + (ne ? "; " + ne + " enemy banners / HQs from other tags" : "") + ".";
-  results = []; sel = -1; $("results").hidden = true; current = null;
+  results = []; sel = -1; $("results").hidden = true; current = null; repair = null;
+  console.log("[csv] " + all.length + " rows, " + ignored.length + " ignored (" + [...ignore].join(" ") + "), tag " + tag + ": " + mineB.length + " banners, Badland HQ " + (h ? h[1] + "," + h[2] : "none") + ", " + own.plainsHqs.length + " Plains HQ(s), " + ne + " enemy rows");
+  if (h) { hq = [+h[1], +h[2]]; $("hx").value = hq[0]; $("hy").value = hq[1]; view.cu = hq[0] + 1.5; view.cv = hq[1] + 1.5; }
+  buildScan();
+  splitOwn();
   buildScan(); scanList();
-  if (h) setHQ(+h[1], +h[2], true); else changed();
+  csvMsg(h, ne, ignored.length);
+  changed();
   fit();
   evaluateCurrent();
+  console.log("[csv] loaded in " + Math.round(performance.now() - t0) + " ms");
 };
+function csvMsg(h, ne, ni) {
+  const p = own.plains.length;
+  $("csvmsg").textContent = own.tag + ": " + own.banners.length + " banners" + (h ? " with the Badland HQ " + h[1] + "," + h[2] : ", no Badland HQ") +
+    (own.plainsHqs.length ? (p ? "; " + p + " chained only to the Plains HQ (left out)" : "; Plains HQ " + own.plainsHqs.map(key).join(" ") + " left out") : "") +
+    (ne ? "; " + ne + " enemy banners / HQs from other tags" : "") + (ni ? "; " + ni + " rows of ignored tags" : "") + ".";
+}
+/* With "Connect only to the Badland HQ": the banners chained only to a Plains HQ leave the network
+   (same link rules as the solver, with the current enemies and scan). */
+function splitOwn() {
+  if (!own.all) own.all = own.banners.slice();
+  own.banners = own.all.slice(); own.plains = [];
+  if (!hq || !world || !own.all.length || !own.plainsHqs || !own.plainsHqs.length || !$("badlandOnly").checked) return;
+  const o = options();
+  const r = Net.splitNetworks(world, hq[0], hq[1], own.plainsHqs, own.all, { enemies: o.enemies, mask: o.mask, verbose: true });
+  own.banners = r.badland; own.plains = r.plains;
+}
+$("badlandOnly").addEventListener("change", () => {
+  if (!own.all || !own.all.length) return;
+  results = []; sel = -1; $("results").hidden = true; current = null; repair = null;
+  buildScan(); splitOwn(); buildScan(); scanList();
+  csvMsg(hq ? ["hq", hq[0], hq[1]] : null, enemies.filter((e) => e.src === "csv").length, 0);
+  changed(); evaluateCurrent();
+});
 /* Score the CSV's network (same targets, enemies and rules as a run) to shade and list it. */
 function evaluateCurrent(then) {
   if (!hq || !own.banners.length) return;
+  $("current").hidden = false;
+  if (!current) { $("curstats").innerHTML = '<div class="msg">Scoring the network from the CSV…</div>'; $("curfix").innerHTML = ""; }
   const ev = new Worker("worker.js");
-  ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; showCurrent(); terrCache.ref = null; draw(); if (then) then(); } ev.terminate(); };
+  ev.onmessage = (e) => { if (e.data.type === "current") { current = e.data.current; repair = e.data.repair || null; showCurrent(); terrCache.ref = null; draw(); if (then) then(); } ev.terminate(); };
   ev.postMessage({ kind: "evaluate", hx: hq[0], hy: hq[1], banners: own.banners, opts: options() });
 }
 $("clearcsv").onclick = () => {
-  $("csvin").value = ""; own = { tag: "", banners: [] }; current = null;
+  $("csvin").value = ""; own = { tag: "", banners: [], all: [], plains: [], plainsHqs: [], guides: [] }; current = null; repair = null;
   enemies = enemies.filter((e) => e.src !== "csv");
   $("csvmsg").textContent = ""; $("current").hidden = true; buildScan(); scanList(); changed();
 };
@@ -704,14 +765,20 @@ function options() {
     baseType: $("btype").value, basePerHour: Math.max(0, num("bper", 50000)),
     forced: forced.slice(), excluded: excluded.slice(),
     offKinds: Net.KINDS.filter((k, i) => { const e = $("kind" + i); return e && !e.checked; }),
-    enemies: enemies.map((e) => ({ type: e.type, x: e.x, y: e.y })),
+    // your Plains network counts as ground the Badland network keeps off
+    enemies: enemies.map((e) => ({ type: e.type, x: e.x, y: e.y })).concat(plainsGround()),
     mask: scanR && scanR.runs.length ? { key: scanR.key, runs: scanR.runs } : null,
     variants: Math.max(1, Math.min(16, Math.round(num("variants", 4)))),
     improveMs: Math.max(0, Math.round(num("secs", 30) * 1000)),
     emptyWeight: Math.max(0, num("ew", 1.5) - 1),
     existing: own.banners.slice(), existingCost: Math.max(0, Math.min(1, num("exc", 0.5))),
+    surplusValue: Math.max(0, num("sv", 0.5)), verbose: true,
     maxBanners: Math.max(20, Math.min(285, Math.round(num("cap", 285)))),
   };
+}
+function plainsGround() {
+  if (!$("badlandOnly").checked || !own.plains || !own.plainsHqs || !own.plainsHqs.length) return [];
+  return own.plainsHqs.map(([x, y]) => ({ type: "hq", x, y })).concat(own.plains.map(([x, y]) => ({ type: "banner", x, y })));
 }
 const kph = (n) => Math.round(n * Net.NODE_RATE / 1000) + "k";
 function refreshAll() {
@@ -765,6 +832,7 @@ $("run").onclick = () => {
       clearInterval(timer); timer = null;
       $("run").disabled = false; $("prog").style.width = "100%";
       results = m.results;
+      if (m.repair) repair = m.repair;
       $("runmsg").textContent = "Done in " + Math.round(m.ms / 1000) + " s (" + m.workers + (m.workers > 1 ? " workers)." : " worker).");
       if (results.length) { $("results").hidden = false; listResults(); pick(0); fit(); }
     } else if (m.type === "error") {
@@ -811,9 +879,45 @@ function statsHtml(d, cmp) {
   };
   const head = cmp ? "<tr><th></th><th>Current</th><th>Proposed</th><th>Change</th></tr>" : "";
   const body = rows.map((r) => "<tr" + (r.title ? ' title="' + r.title + '"' : "") + "><td>" + r.l + (r.ls ? '<span class="sub">' + r.ls + "</span>" : "") + "</td>" + (cmp ? cell(r, cmp) : "") + cell(r, d) + (cmp ? change(r) : "") + "</tr>").join("");
+  // cut-off banners and banners on bad ground, named with what stands there
+  const errs = d.cutGroups && d.cutGroups.length ? d.errors.filter((w) => !/not chained to the HQ/.test(w)).concat(cutText(d.cutGroups)) : d.errors;
+  const warns = (d.warnings || []).filter((w) => !(d.onEnemy && /stand on enemy ground/.test(w)))
+    .concat(d.onEnemy && d.onEnemy.length ? [d.onEnemy.slice(0, 6).map(([x, y]) => x + "," + y + " stands on " + groundAt(x, y)).join("; ") + (d.onEnemy.length > 6 ? " … (" + d.onEnemy.length + " in all)" : "") + ": it can't be built there."] : []);
   return '<table class="stat' + (cmp ? " cmp" : "") + '">' + head + body + "</table>" +
-    d.errors.map((w) => '<div class="err">' + w + "</div>").join("") +
-    (d.warnings || []).concat(notes).map((w) => '<div class="warn">' + w + "</div>").join("");
+    errs.map((w) => '<div class="err">' + w + "</div>").join("") +
+    warns.concat(notes).map((w) => '<div class="warn">' + w + "</div>").join("");
+}
+/* What stands on a tile, in words (for banners the map data says can't stand there). */
+function groundAt(x, y) {
+  const c = y * M + x;
+  if (scanR && scanR.forbid[c] && scanR.piece[c]) return scan.pieces[scanR.piece[c] - 1].name + "'s ground (scan)";
+  if (scanR && scanR.forbid[c] && scanR.unseen[c]) return "unseen tiles counted as enemy (scan)";
+  const inSq = (e) => { const [x0, y0, w] = enemySq(e); return x >= x0 && x < x0 + w && y >= y0 && y < y0 + w; };
+  const e = enemies.find(inSq);
+  if (e) return "the square of an enemy " + (e.type === "hq" ? "HQ" : "banner") + " at " + e.x + "," + e.y;
+  if (plainsGround().some(inSq)) return "your Plains network's ground";
+  return "ground that can't hold a banner";
+}
+function cutText(groups) {
+  return groups.map((g) => {
+    const n = g.banners.length;
+    if (g.bad.length) {
+      const beyond = n - g.bad.length;
+      return g.bad.map(([x, y]) => x + "," + y + " stands on " + groundAt(x, y)).join("; ") + ": " + (beyond ? "it and " + beyond + " banner(s) beyond it are" : "it is") + " cut off from the HQ";
+    }
+    return n + " banner(s) around " + key(g.banners[0]) + " are cut off from the HQ (no owned tiles link them)";
+  });
+}
+/* Step 0 for the CSV's network, in words. */
+function repairHtml() {
+  if (!repair) return "";
+  if (!repair.fixes.length) return repair.after.chained < repair.after.banners ? '<div class="msg">Step 0 found no fix that costs at most one new banner: the cut-off banners are left to the search.</div>' : "";
+  const line = (f) => f.type === "move"
+    ? "Move " + key(f.from) + " → " + key(f.to) + (f.reconnects ? ": chains " + f.reconnects + " banner(s) back" : "") + (f.offBadGround ? (f.reconnects ? ", " : ": ") + "off ground that can't hold it" : "")
+    : "New banner " + key(f.at) + " as a bridge: chains " + f.reconnects + " banner(s) back";
+  return '<div class="msg" style="margin-top:8px"><b>Step 0</b> (done first by "Design network"; the moves show on the map in cyan):</div><div class="list">' +
+    repair.fixes.map((f) => "<div><span>" + line(f) + "</span></div>").join("") + "</div>" +
+    '<div class="msg">After it: ' + repair.after.chained + " of " + repair.after.banners + " banners chained to the HQ" + (repair.after.bad ? ", " + repair.after.bad + " still on ground that can't hold one" : "") + ".</div>";
 }
 function listResults() {
   const box = $("designs"); box.innerHTML = "";
@@ -840,6 +944,7 @@ function showCurrent() {
   if (!current) return;
   $("current").hidden = false;
   $("curstats").innerHTML = statsHtml(current, null);
+  $("curfix").innerHTML = repairHtml();
   // the selected network's table gains the comparison column once the current one is scored
   if (results[sel]) $("stats").innerHTML = statsHtml(results[sel], current);
 }

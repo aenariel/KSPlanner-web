@@ -19,8 +19,11 @@
  * Method: pass 1 builds a network with as many resources as it can (the outposts reached on the
  * way, every bridge chosen to complete nodes), pass 2 takes away every banner the outposts, the
  * links and the resource targets don't need, then a local search removes and re-routes banners
- * while that lowers the cost (banners + emptyWeight per empty banner). Several variants run (order
- * of the work, choice of outposts) and the cheapest is kept.
+ * while that lowers the cost (banners + emptyWeight per empty banner - surplusValue per node above
+ * a type's minimum: the minimum is a floor, more is a bonus). Several variants run (order of the
+ * work, choice of outposts) and the cheapest is kept. With a pasted network (opts.existing), step 0
+ * first fixes its cheap errors (repairImport: a banner moved up to 2 tiles or one bridge), and one
+ * variant in three starts from it, taking back its banners again after each bridge.
  *
  * Runs in a browser worker or in Node (module.exports). Needs a world from Hive.buildWorld.
  */
@@ -373,9 +376,10 @@
   }
 
   // positions whose square touches outpost o's zone, with their level
-  function outpostSpots(st, F, o) {
+  function outpostSpots(st, F, o, slack) {
+    slack = slack || 0;
     let best = 0;
-    const spots = [];
+    const all = [];
     for (let y = o.fy - 4; y <= o.fy + o.fz + 3; y++) for (let x = o.fx - 4; x <= o.fx + o.fz + 3; x++) {
       if (x >= o.fx && x < o.fx + o.fz && y >= o.fy && y < o.fy + o.fz) continue;
       const l = F.at(x, y);
@@ -388,10 +392,14 @@
         if (xx >= 0 && yy >= 0 && xx < MAP && yy < MAP && !st.P.noOwn[yy * MAP + xx]) { touches = true; break; }
       }
       if (!touches) continue;
-      if (!best || l < best) { best = l; spots.length = 0; }
-      if (l === best) spots.push([x, y]);
+      if (!best || l < best) best = l;
+      all.push([x, y, l]);
     }
-    return best ? { lvl: best, spots } : null;
+    if (!best) return null;
+    const spots = all.filter((p) => p[2] === best).map((p) => [p[0], p[1]]);
+    // detours: spots 1..slack levels further, for chains that pass by resources
+    const detours = slack ? all.filter((p) => p[2] > best && p[2] <= best + slack).map((p) => [p[0], p[1]]) : [];
+    return { lvl: best, spots, detours };
   }
 
   function netBox(st, extra) {
@@ -400,6 +408,8 @@
     if (extra) for (const r of extra) { x1 = Math.min(x1, r[0]); y1 = Math.min(y1, r[1]); x2 = Math.max(x2, r[2]); y2 = Math.max(y2, r[3]); }
     return [x1, y1, x2, y2];
   }
+
+  const DETOUR = 2;   // outpost chains may run up to this many banners longer to pass by resources
 
   // ---------------------------------------------------------------- targets
   /* Minimum nodes per type: the base type's hourly amount (each node 3600/h), the others by the
@@ -425,15 +435,26 @@
   }
 
   // ---------------------------------------------------------------- pass 1: build
-  function connectOutposts(st, opts, rand, noise) {
+  function connectOutposts(st, opts, rand, noise, focus) {
     for (let guard = 0; guard < st.goals.length + 1; guard++) {
       const todo = [];
       for (const g of st.goals) if (!goalMet(st, g)) for (const o of g.list) todo.push(o);
       if (!todo.length) return true;
-      const box = netBox(st, todo.map((o) => [o.fx - 12, o.fy - 12, o.fx + o.fz + 11, o.fy + o.fz + 11]));
+      // with a focus: only the outposts near it (a kind has outposts all over the map; boxes around
+      // all of them make the distance field cover most of the map)
+      if (focus) {
+        const d = (o) => Math.max(focus[0] - (o.fx + o.fz), o.fx - focus[2], focus[1] - (o.fy + o.fz), o.fy - focus[3], 0);
+        const close = todo.filter((o) => d(o) <= 40);
+        if (!close.length) return false;
+        todo.length = 0; todo.push(...close);
+      }
+      const near = todo.map((o) => [o.fx - 12, o.fy - 12, o.fx + o.fz + 11, o.fy + o.fz + 11]);
+      // with a focus: only the area where banners were taken away and the outposts to reach
+      const box = focus ? near.reduce((b, r) => [Math.min(b[0], r[0]), Math.min(b[1], r[1]), Math.max(b[2], r[2]), Math.max(b[3], r[3])], focus.slice()) : netBox(st, near);
       // stop a few layers after the first outpost zone is in reach (room for the seeded noise)
       let firstAt = 0;
-      const extra = noise ? 4 : 0;
+      // a few layers past the first outpost zone in reach: room for the noise and for detours
+      const extra = Math.max(noise ? 4 : 0, DETOUR);
       const F = field(st, [box[0] - 8, box[1] - 8, box[2] + 8, box[3] + 8], 160, (lvl, d, x0, y0, W) => {
         if (firstAt) return d >= firstAt + extra;
         const H = lvl.length / W;
@@ -452,16 +473,19 @@
       // nearest kind first (seeded noise picks among near ties)
       let pick = null, pickCost = 1e9;
       for (const o of todo) {
-        const s = outpostSpots(st, F, o);
+        const s = outpostSpots(st, F, o, DETOUR);
         if (!s) continue;
         const c = s.lvl + noise * rand() * Math.sqrt(s.lvl);
         if (c < pickCost) { pickCost = c; pick = { o, s }; }
       }
       if (!pick) return false;
       let best = null, bestG = -1e9;
-      for (const p of sample(pick.s.spots, opts.pathSamples || 8, rand)) {
+      // shortest chains, and chains 1..DETOUR banners longer: one only wins if what it captures on
+      // the way is worth more than its extra banners
+      const tries = sample(pick.s.spots, opts.pathSamples || 8, rand).concat(sample(pick.s.detours || [], opts.detourSamples || 6, rand));
+      for (const p of tries) {
         const path = pathTo(st, F, p[0], p[1], val, rand);
-        const g = trialGain(st, path, val) + (path.length - pathCost(st, path)) + rand() * 1e-3;
+        const g = trialGain(st, path, val) - pathCost(st, path) + rand() * 1e-3;
         if (g > bestG) { bestG = g; best = path; }
       }
       for (const [x, y] of best) addBanner(st, x, y, null);
@@ -590,34 +614,139 @@
   function bCost(st, x, y) { return st.existing.has(y * MAP + x) ? st.exCost : 1; }
   function pathCost(st, path) { let c = 0; for (const [x, y] of path) c += bCost(st, x, y); return c; }
 
+  const emptyW = (opts) => (opts.emptyWeight != null ? opts.emptyWeight : 0.5);
+  // a node above a type's minimum is a bonus worth this many banners (0 = worthless)
+  const surplusV = (opts) => (opts.surplusValue != null ? opts.surplusValue : 0.5);
+  function surplusOf(st, T) { let s = 0; for (let t = 0; t < 4; t++) s += Math.max(0, st.count[t] - T[t]); return s; }
+
+  /* Cost of a network: banners (the ones already built count opts.existingCost), plus emptyWeight
+     per empty banner, minus surplusValue per node above the minimum of its type. */
   function costOf(st, A, opts) {
     const empty = A.need.filter((l) => !l.length).length;
     let c = 0;
     for (const [x, y] of st.banners) c += bCost(st, x, y);
-    return c + (opts.emptyWeight != null ? opts.emptyWeight : 0.5) * empty;
+    return c + emptyW(opts) * empty - surplusV(opts) * surplusOf(st, targetsOf(opts));
   }
 
+  // verbose logging (one line per step) when opts.verbose; quiet otherwise
+  const logOf = (opts) => (opts && opts.verbose ? (...a) => console.log("[net]", ...a) : () => {});
+
   // ---------------------------------------------------------------- pass 2: prune
+  /* Take banners away one at a time while that lowers the cost: never a link (articulation), never
+     the only banner reaching an outpost, never below a type's minimum. What a banner is worth: its
+     cost, plus emptyWeight if it is empty, minus surplusValue per node only it completes (every
+     such node is above the minimum, or the banner could not go). When no single banner can go,
+     dead-end chains (a leaf and the banners with two links behind it) are tried as a whole. */
   function prune(st, opts) {
-    const T = targetsOf(opts);
+    const T = targetsOf(opts), w = emptyW(opts), sv = surplusV(opts);
     for (;;) {
       const A = analyse(st);
-      let best = -1, bestKey = 1e9;
+      let best = -1, bestKey = -1e9;
       for (let i = 0; i < st.banners.length; i++) {
         if (A.art[i] || A.keeps[i].length) continue;
         const lost = [0, 0, 0, 0];
         for (const nd of A.need[i]) lost[st.P.nodes[nd].t]++;
         if (TYPES.some((_, t) => st.count[t] - lost[t] < T[t])) continue;
-        // empty first; then the least lost (keeps slack), surplus-relative
-        let key = 0;
-        for (let t = 0; t < 4; t++) if (lost[t]) key += lost[t] / Math.max(1, st.count[t] - T[t] + 1);
-        key += A.adj[i].length * 1e-3;
-        key += (1 - bCost(st, st.banners[i][0], st.banners[i][1])) * 2;   // a banner already there goes last
-        if (key < bestKey) { bestKey = key; best = i; }
+        const nl = lost[0] + lost[1] + lost[2] + lost[3];
+        const gain = bCost(st, st.banners[i][0], st.banners[i][1]) + (nl ? 0 : w) - sv * nl;
+        if (gain <= 1e-9) continue;
+        const key = gain - A.adj[i].length * 1e-3;
+        if (key > bestKey) { bestKey = key; best = i; }
       }
-      if (best < 0) return;
-      removeBannerAt(st, best);
+      if (best >= 0) { removeBannerAt(st, best); continue; }
+      if (!pruneChain(st, opts, A, T)) return;
     }
+  }
+
+  /* Dead-end chains: from each leaf, the banners with exactly two links behind it (none holding an
+     outpost alone). Every prefix from the leaf is tried by lifting its squares; the best one that
+     lowers the cost and keeps every minimum is removed. */
+  function pruneChain(st, opts, A, T) {
+    const n = st.banners.length, w = emptyW(opts), sv = surplusV(opts);
+    const total = () => st.count[0] + st.count[1] + st.count[2] + st.count[3];
+    let best = null, bestGain = 1e-9;
+    for (let i = 0; i < n; i++) {
+      if (A.adj[i].length !== 1 || A.keeps[i].length || !A.reach[i]) continue;
+      const chain = [i];
+      let prev = i, cur = A.adj[i][0];
+      while (cur < n && A.adj[cur].length === 2 && !A.keeps[cur].length && chain.length < 12) {
+        chain.push(cur);
+        const nx = A.adj[cur][0] === prev ? A.adj[cur][1] : A.adj[cur][0];
+        prev = cur; cur = nx;
+      }
+      if (chain.length < 2) continue;
+      const before = total();
+      let cost = 0, empties = 0;
+      const lifted = [];
+      for (let k = 0; k < chain.length; k++) {
+        const [x, y] = st.banners[chain[k]];
+        sqAdd(st, x - 3, y - 3, x + 3, y + 3, -1, null);
+        lifted.push(chain[k]);
+        cost += bCost(st, x, y);
+        if (!A.need[chain[k]].length) empties++;
+        if (k === 0) continue;
+        if (TYPES.some((_, t) => st.count[t] < T[t])) break;
+        const gain = cost + w * empties - sv * (before - total());
+        if (gain > bestGain) { bestGain = gain; best = lifted.slice(); }
+      }
+      for (const j of lifted) { const [x, y] = st.banners[j]; sqAdd(st, x - 3, y - 3, x + 3, y + 3, 1, null); }
+    }
+    if (!best) return false;
+    best.sort((a, b) => b - a);
+    for (const j of best) removeBannerAt(st, j);
+    return true;
+  }
+
+  /* Move a banner to another tile (keeps its index). */
+  function moveBanner(st, i, nx, ny) {
+    const [x, y] = st.banners[i];
+    sqAdd(st, x - 3, y - 3, x + 3, y + 3, -1, null);
+    st.occ[y * MAP + x] = 0; st.bid[y * MAP + x] = -1;
+    st.banners[i] = [nx, ny];
+    st.occ[ny * MAP + nx] = 1; st.bid[ny * MAP + nx] = i;
+    sqAdd(st, nx - 3, ny - 3, nx + 3, ny + 3, 1, null);
+  }
+
+  /* Empty banners moved up to maxD tiles where they complete nodes, as long as the network stays
+     whole (every banner chained, outposts, minimums) and the cost drops. */
+  function shiftEmpties(st, opts, maxD) {
+    maxD = maxD || 3;
+    const log = logOf(opts), t0 = Date.now();
+    const total = () => st.count[0] + st.count[1] + st.count[2] + st.count[3];
+    let moves = 0, tried = 0;
+    for (let pass = 0; pass < 3; pass++) {
+      let A = analyse(st), cost = costOf(st, A, opts), any = false;
+      for (let i = 0; i < st.banners.length; i++) {
+        if (A.need[i].length || A.keeps[i].length) continue;
+        const [x, y] = st.banners[i];
+        // lift it (empty: no node depends on it), then rank the spots around by nodes completed
+        sqAdd(st, x - 3, y - 3, x + 3, y + 3, -1, null);
+        st.occ[y * MAP + x] = 0;
+        const base = total(), spots = [];
+        for (let dy = -maxD; dy <= maxD; dy++) for (let dx = -maxD; dx <= maxD; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if ((!dx && !dy) || nx < 0 || ny < 0 || nx >= MAP || ny >= MAP || !placeable(st, ny * MAP + nx)) continue;
+          sqAdd(st, nx - 3, ny - 3, nx + 3, ny + 3, 1, null);
+          const gain = total() - base;
+          sqAdd(st, nx - 3, ny - 3, nx + 3, ny + 3, -1, null);
+          if (gain > 0) spots.push([gain, Math.max(Math.abs(dx), Math.abs(dy)), nx, ny]);
+        }
+        st.occ[y * MAP + x] = 1;
+        sqAdd(st, x - 3, y - 3, x + 3, y + 3, 1, null);
+        spots.sort((a, b) => (b[0] - a[0]) || (a[1] - b[1]));
+        for (const [, , nx, ny] of spots.slice(0, 6)) {
+          tried++;
+          moveBanner(st, i, nx, ny);
+          const c = check(st, opts);
+          const nc = c.errors.length ? 1e9 : costOf(st, c.A, opts);
+          if (nc < cost - 1e-9) { cost = nc; A = c.A; moves++; any = true; break; }
+          moveBanner(st, i, x, y);
+        }
+      }
+      if (!any) break;
+    }
+    log("shift empties: " + moves + " moved (" + tried + " spots tried) in " + (Date.now() - t0) + " ms");
+    return moves;
   }
 
   // ---------------------------------------------------------------- checks
@@ -649,34 +778,106 @@
   }
 
   // ---------------------------------------------------------------- pass 3: local search
-  /* Take one banner away and re-link what falls off with the cheapest chains, then prune; kept
-     when the cost drops. Also tries moving each empty banner to a spot that completes a node. */
+  /* Two moves, in rounds, for the time given:
+     1. take one banner away with whatever it cuts off (a whole arm when it is a link), re-link what
+        went missing (outposts, then short types) with chains near where the arm was, prune;
+     2. add one banner next to the network where it completes nodes, then prune (with the extra
+        nodes, banners elsewhere may stop being needed).
+     A move is kept when the cost drops, or when it stays the same for a different network (up to
+     opts.sidewaysSteps in a row, never back to a network already seen): such neutral steps let one
+     arm give way to another (A loses 4 banners and 3 wood, B gains 5 banners, 3 wood and 2 stone)
+     before the next move cashes in the extra (the stone lets a third arm shrink). The best network
+     seen is the one kept. */
   function improve(world, st, opts, rand, budgetMs) {
-    const t0 = Date.now();
+    const t0 = Date.now(), log = logOf(opts);
     const T = targetsOf(opts);
-    let A = analyse(st), cost = costOf(st, A, opts);
-    let tries = 0, gains = 0;
-    const order = () => st.banners.map((_, i) => i).sort(() => rand() - 0.5);
-    let improved = true;
-    while (improved && Date.now() - t0 < budgetMs) {
-      improved = false;
-      for (const i of order()) {
-        if (Date.now() - t0 > budgetMs) break;
+    const sigOf = () => st.banners.map(([x, y]) => y * MAP + x).sort((a, b) => a - b).join(",");
+    let cost = costOf(st, analyse(st), opts);
+    let best = { cost, banners: snapshot(st) };
+    const seen = new Set([sigOf()]);
+    const maxSide = opts.sidewaysSteps != null ? opts.sidewaysSteps : 25;
+    const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0 };
+    let side = 0;
+    const out = () => Date.now() - t0 > budgetMs;
+    // keep the state as it is now? (cost already checked: no errors)
+    const accept = (nc) => {
+      if (nc < cost - 1e-9) return "gain";
+      if (nc <= cost + 1e-9 && side < maxSide) { const g = sigOf(); if (!seen.has(g)) { seen.add(g); return "side"; } }
+      return null;
+    };
+    const took = (kind, nc) => {
+      if (kind === "gain") { stats.gains++; side = 0; seen.add(sigOf()); } else { stats.sideways++; side++; }
+      cost = nc;
+      if (cost < best.cost - 1e-9) best = { cost, banners: snapshot(st) };
+    };
+    const evalNow = () => { const c = check(st, opts); return c.errors.length ? null : costOf(st, c.A, opts); };
+    for (let changed = true; changed && !out();) {
+      changed = false; stats.rounds++;
+      // move 1: an arm away, re-linked locally
+      for (const i of st.banners.map((_, k) => k).sort(() => rand() - 0.5)) {
+        if (out()) break;
         if (i >= st.banners.length) continue;
-        tries++;
+        stats.tries++;
         const before = snapshot(st);
+        const gone = new Set(before.map(([x, y]) => y * MAP + x));
         removeBannerAt(st, i);
-        // drop what is cut off from the HQ, then rebuild needs
         dropCut(st);
-        repair(st, opts, rand, T);
+        for (const [x, y] of st.banners) gone.delete(y * MAP + x);
+        let fx1 = MAP, fy1 = MAP, fx2 = 0, fy2 = 0;
+        for (const c of gone) { const x = c % MAP, y = (c / MAP) | 0; fx1 = Math.min(fx1, x); fy1 = Math.min(fy1, y); fx2 = Math.max(fx2, x); fy2 = Math.max(fy2, y); }
+        repair(st, opts, rand, T, [fx1 - 7, fy1 - 7, fx2 + 7, fy2 + 7]);
         prune(st, opts);
-        const c = check(st, opts);
-        const nc = c.errors.length ? 1e9 : costOf(st, c.A, opts);
-        if (nc < cost - 1e-9) { cost = nc; improved = true; gains++; }
-        else resetTo(st, before);
+        const nc = evalNow();
+        const k = nc == null ? null : accept(nc);
+        if (k) { took(k, nc); changed = true; } else resetTo(st, before);
+      }
+      // move 2: one banner more where it completes nodes, then prune
+      if (!out() && addOne(st, opts, rand, out, (nc) => { const k = accept(nc); if (k) { took(k, nc); stats.adds++; } return !!k; }, stats)) changed = true;
+    }
+    if (best.cost < cost - 1e-9) resetTo(st, best.banners);
+    const ms = Date.now() - t0;
+    log("pass 3: " + stats.rounds + " round(s), " + stats.tries + " arm tries (" + stats.gains + " gains, " + stats.sideways + " neutral steps), " +
+      stats.addTries + " one-more tries (" + stats.adds + " kept), best cost " + best.cost.toFixed(2) + ", " + ms + " ms");
+    return { tries: stats.tries + stats.addTries, gains: stats.gains, sideways: stats.sideways, adds: stats.adds, ms };
+  }
+
+  /* Move 2 of the local search: every free tile one link away from the network whose square
+     completes nodes, best first; each is added, the network pruned, and kept if `keep(cost)` says so. */
+  function addOne(st, opts, rand, out, keep, stats) {
+    const box = netBox(st);
+    const F = field(st, [box[0] - 8, box[1] - 8, box[2] + 8, box[3] + 8], 1);
+    const total = () => st.count[0] + st.count[1] + st.count[2] + st.count[3];
+    const seenSpot = new Set(), cands = [];
+    for (const n of st.P.nodes) {
+      if (st.full[n.i] || n.x < F.x0 || n.y < F.y0 || n.x >= F.x0 + F.W || n.y >= F.y0 + F.H) continue;
+      const s = nodeSpots(st, F, n);
+      if (!s || s.lvl !== 1) continue;
+      for (const [x, y] of s.spots) {
+        const c = y * MAP + x;
+        if (seenSpot.has(c)) continue;
+        seenSpot.add(c);
+        const base = total();
+        sqAdd(st, x - 3, y - 3, x + 3, y + 3, 1, null);
+        const gain = total() - base;
+        sqAdd(st, x - 3, y - 3, x + 3, y + 3, -1, null);
+        if (gain > 0) cands.push([gain + rand() * 0.1, x, y]);
       }
     }
-    return { tries, gains, ms: Date.now() - t0 };
+    cands.sort((a, b) => b[0] - a[0]);
+    let any = false;
+    for (const [, x, y] of cands.slice(0, opts.addTries || 40)) {
+      if (out()) break;
+      if (!placeable(st, y * MAP + x)) continue;
+      stats.addTries++;
+      const before = snapshot(st);
+      addBanner(st, x, y, null);
+      prune(st, opts);
+      const c = check(st, opts);
+      const nc = c.errors.length ? null : costOf(st, c.A, opts);
+      if (nc != null && keep(nc)) any = true;
+      else resetTo(st, before);
+    }
+    return any;
   }
 
   function dropCut(st) {
@@ -690,17 +891,22 @@
     }
   }
 
-  /* Bring back what is missing: outpost kinds first (nearest), then nodes of short types. */
-  function repair(st, opts, rand, T) {
-    connectOutposts(st, opts, rand, 0);
+  /* Bring back what is missing: outpost kinds first (nearest), then nodes of short types. With a
+     focus box (where banners were just taken away), the distance fields only cover that area and
+     its surroundings (much faster); the whole network is the fallback when nothing is found there. */
+  function repair(st, opts, rand, T, focus) {
+    if (!connectOutposts(st, opts, rand, 0, focus) && focus) connectOutposts(st, opts, rand, 0);
+    const sv = Math.min(0.5, surplusV(opts) * 0.5);
     for (let guard = 0; guard < 60; guard++) {
       const short = TYPES.map((_, t) => st.count[t] < T[t]);
       if (!short.some(Boolean)) return;
-      const val = (n) => (short[n.t] && st.count[n.t] < T[n.t] ? 1 : 0.05);
-      let depth = 3, best = null, bestR = -1;
-      for (; depth <= 12 && !best; depth += 3) {
-        const box = netBox(st);
-        const F = field(st, [box[0] - 7 * depth, box[1] - 7 * depth, box[2] + 7 * depth, box[3] + 7 * depth], depth);
+      // short types first; surplus nodes on the way are a small bonus
+      const val = (n) => (short[n.t] && st.count[n.t] < T[n.t] ? 1 : sv);
+      let best = null, bestR = -1;
+      for (const area of focus ? [focus, null] : [null]) {
+        for (let depth = 3; depth <= 12 && !best; depth += 3) {
+          const box = area || netBox(st);
+          const F = field(st, [box[0] - 7 * depth, box[1] - 7 * depth, box[2] + 7 * depth, box[3] + 7 * depth], depth);
         for (const n of st.P.nodes) {
           if (st.full[n.i] || !short[n.t]) continue;
           if (n.x < F.x0 || n.y < F.y0 || n.x >= F.x0 + F.W || n.y >= F.y0 + F.H) continue;
@@ -710,6 +916,8 @@
           const r = trialGain(st, path, val) / path.length;
           if (r > bestR) { bestR = r; best = path; }
         }
+        }
+        if (best) break;
       }
       if (!best) return;
       for (const [x, y] of best) addBanner(st, x, y, null);
@@ -733,6 +941,137 @@
   }
 
   // ---------------------------------------------------------------- evaluation of any network
+  /* The banners cut off from the HQ, in groups that link among themselves; for each, the banners of
+     the group standing on ground that can't hold one (enemy, unseen, terrain): the likely cause. */
+  function cutGroupsOf(st, A) {
+    const n = st.banners.length, seen = new Uint8Array(n), groups = [];
+    for (let i = 0; i < n; i++) {
+      if (A.reach[i] || seen[i]) continue;
+      const list = [i]; seen[i] = 1;
+      for (let k = 0; k < list.length; k++) for (const j of A.adj[list[k]]) if (j < n && !A.reach[j] && !seen[j]) { seen[j] = 1; list.push(j); }
+      const banners = list.map((j) => st.banners[j].slice());
+      const bad = banners.filter(([x, y]) => st.P.noOwn[y * MAP + x] || (st.world.block[y * MAP + x] & 2));
+      groups.push({ banners, bad });
+    }
+    return groups.sort((a, b) => b.banners.length - a.banners.length);
+  }
+
+  /* Which of an alliance's banners chain to its Badland HQ (hx, hy) and which only to one of its
+     Plains HQs (lower-left tiles). Banners that chain to neither stay with the Badland network
+     (they show as cut off there). Same link rules as everything else (owned tiles only). */
+  function splitNetworks(world, hx, hy, plainsHqs, banners, opts) {
+    const t0 = Date.now(), log = logOf(opts);
+    const st = rebuild(world, hx, hy, banners, opts || {});
+    const A = analyse(st), n = st.banners.length;
+    const fromPlains = new Uint8Array(n), queue = [];
+    for (const [px, py] of plainsHqs || []) {
+      const sq = [px - 6, py - 6, px + 8, py + 8];
+      for (let i = 0; i < n; i++) {
+        const [x, y] = st.banners[i];
+        if (!fromPlains[i] && Math.abs(x - (px + 1)) <= 11 && Math.abs(y - (py + 1)) <= 11 && rectsLink(st.P, sq, bRect(x, y))) { fromPlains[i] = 1; queue.push(i); }
+      }
+    }
+    for (let k = 0; k < queue.length; k++) for (const j of A.adj[queue[k]]) if (j < n && !fromPlains[j]) { fromPlains[j] = 1; queue.push(j); }
+    const badland = [], plains = [];
+    let both = 0, loose = 0, looseP = 0;
+    // banners chained to neither go with the nearer network (its chained banners and its HQ)
+    const near = (x, y, pts) => pts.reduce((m, [px, py]) => Math.min(m, Math.max(Math.abs(px - x), Math.abs(py - y))), 1e9);
+    const bPts = [[hx + 1, hy + 1]], pPts = (plainsHqs || []).map(([px, py]) => [px + 1, py + 1]);
+    for (let i = 0; i < n; i++) { if (A.reach[i]) bPts.push(st.banners[i]); else if (fromPlains[i]) pPts.push(st.banners[i]); }
+    for (let i = 0; i < n; i++) {
+      const b = st.banners[i].slice();
+      if (A.reach[i]) { badland.push(b); if (fromPlains[i]) both++; }
+      else if (fromPlains[i]) plains.push(b);
+      else if (pPts.length && near(b[0], b[1], pPts) < near(b[0], b[1], bPts)) { plains.push(b); looseP++; }
+      else { badland.push(b); loose++; }
+    }
+    log("split: " + badland.length + " banners with the Badland HQ (" + both + " also chained to Plains, " + loose + " cut off), " + plains.length + " with the Plains HQ (" + looseP + " of them cut off but nearer to it), " + (Date.now() - t0) + " ms");
+    return { badland, plains, both, loose, looseP };
+  }
+
+  /* Step 0, for a pasted network: fix what keeps its banners from standing or chaining, when that is
+     cheap. (1) Move a banner up to 2 tiles: one standing on ground that can't hold a banner, or a cut
+     off one near the chained network; kept when more banners chain to the HQ, or one fewer stands on
+     bad ground, without losing any. (2) Else one new banner as a bridge to a cut-off group, kept when
+     it brings back at least 2 banners. Repeats while something is fixed. */
+  function repairImport(world, hx, hy, banners, opts) {
+    const t0 = Date.now(), log = logOf(opts);
+    const st = rebuild(world, hx, hy, banners, opts || {});
+    const badAt = (x, y) => !!(st.P.noOwn[y * MAP + x] || (st.world.block[y * MAP + x] & 2));
+    // more banners chained, then fewer on bad ground, then more nodes captured
+    const score = (A) => { let r = 0, b = 0; for (let i = 0; i < st.banners.length; i++) { if (A.reach[i]) r++; const [x, y] = st.banners[i]; if (badAt(x, y)) b++; } return { r, b, nodes: st.count[0] + st.count[1] + st.count[2] + st.count[3] }; };
+    const better = (a, b) => a.r > b.r || (a.r === b.r && (a.b < b.b || (a.b === b.b && a.nodes > b.nodes)));
+    const fixes = [];
+    let A = analyse(st), sc = score(A);
+    const before = { chained: sc.r, bad: sc.b, banners: st.banners.length };
+    log("step 0: " + sc.r + " of " + st.banners.length + " banners chained to the HQ, " + sc.b + " on ground that can't hold one");
+    for (let round = 0; round < 30; round++) {
+      const n = st.banners.length;
+      if (sc.r === n && !sc.b) break;
+      // banners worth moving: on bad ground, or cut off within reach of the chained network
+      const chained = st.banners.filter((_, i) => A.reach[i]);
+      const nearNet = (x, y) => (Math.abs(x - (st.hx + 1)) <= 13 && Math.abs(y - (st.hy + 1)) <= 13) || chained.some(([bx, by]) => Math.abs(bx - x) <= 9 && Math.abs(by - y) <= 9);
+      const cands = [];
+      for (let i = 0; i < n; i++) { const [x, y] = st.banners[i]; if (badAt(x, y) || (!A.reach[i] && nearNet(x, y))) cands.push(i); }
+      let best = null, bestSc = sc, tries = 0;
+      for (const i of cands) {
+        const [x, y] = st.banners[i];
+        for (let d = 1; d <= 2; d++) for (let dy = -d; dy <= d; dy++) for (let dx = -d; dx <= d; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== d) continue;
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= MAP || ny >= MAP || !placeable(st, ny * MAP + nx)) continue;
+          tries++;
+          moveBanner(st, i, nx, ny);
+          const s2 = score(analyse(st));
+          if (better(s2, bestSc)) { bestSc = s2; best = { i, from: [x, y], to: [nx, ny] }; }
+          moveBanner(st, i, x, y);
+        }
+      }
+      if (best) {
+        moveBanner(st, best.i, best.to[0], best.to[1]);
+        fixes.push({ type: "move", from: best.from, to: best.to, reconnects: bestSc.r - sc.r, offBadGround: sc.b - bestSc.b });
+        log("step 0: move " + best.from.join(",") + " -> " + best.to.join(",") + ": " + (bestSc.r - sc.r) + " more banners chained, " + (sc.b - bestSc.b) + " fewer on bad ground (" + tries + " spots tried)");
+        A = analyse(st); sc = bestSc;
+        continue;
+      }
+      // a bridge: one new banner linking the chained network and a cut-off group
+      const groups = [], gid = new Int32Array(n).fill(-1);
+      for (let i = 0; i < n; i++) {
+        if (A.reach[i] || gid[i] >= 0) continue;
+        const list = [i]; gid[i] = groups.length;
+        for (let k = 0; k < list.length; k++) for (const j of A.adj[list[k]]) if (j < n && !A.reach[j] && gid[j] < 0) { gid[j] = groups.length; list.push(j); }
+        groups.push(list);
+      }
+      let bridge = null, bridgeN = 1;
+      const seenSpot = new Set();
+      for (let i = 0; i < n; i++) {
+        if (A.reach[i]) continue;
+        const [x, y] = st.banners[i];
+        if (!nearNet(x, y) && !chained.some(([bx, by]) => Math.abs(bx - x) <= 14 && Math.abs(by - y) <= 14)) continue;
+        for (let ny = y - 7; ny <= y + 7; ny++) for (let nx = x - 7; nx <= x + 7; nx++) {
+          const c = ny * MAP + nx;
+          if (nx < 0 || ny < 0 || nx >= MAP || ny >= MAP || seenSpot.has(c) || !placeable(st, c)) continue;
+          seenSpot.add(c);
+          if (!linksHQ(st, nx, ny) && !chained.some(([bx, by]) => linkB(st, bx, by, nx, ny))) continue;
+          const hit = new Set();
+          for (let j = 0; j < n; j++) if (!A.reach[j] && gid[j] >= 0 && !hit.has(gid[j]) && linkB(st, st.banners[j][0], st.banners[j][1], nx, ny)) hit.add(gid[j]);
+          let back = 0; for (const g of hit) back += groups[g].length;
+          if (back > bridgeN) { bridgeN = back; bridge = [nx, ny]; }
+        }
+      }
+      if (!bridge) break;
+      addBanner(st, bridge[0], bridge[1], null);
+      A = analyse(st);
+      const s2 = score(A);
+      fixes.push({ type: "bridge", at: bridge, reconnects: s2.r - sc.r - 1 });
+      log("step 0: bridge " + bridge.join(",") + ": " + (s2.r - sc.r - 1) + " banners chained again");
+      sc = s2;
+    }
+    const after = { chained: sc.r, bad: sc.b, banners: st.banners.length };
+    log("step 0 done: " + fixes.length + " fix(es), " + after.chained + " of " + after.banners + " chained, " + after.bad + " on bad ground, " + (Date.now() - t0) + " ms");
+    return { banners: st.banners.map((b) => b.slice()), fixes, before, after, ms: Date.now() - t0 };
+  }
+
   function summary(st, opts) {
     const c = check(st, opts);
     const T = targetsOf(opts);
@@ -747,11 +1086,12 @@
     for (const nd of st.P.nodes) if (st.full[nd.i]) captured.push([nd.x, nd.y, nd.t]);
     // banners standing on other alliances' ground (only a pasted network can: the data disagree)
     const onEnemy = st.banners.filter(([x, y]) => st.P.noOwn[y * MAP + x]).map((b) => b.slice());
+    const cutGroups = cutGroupsOf(st, c.A);
     const warnings = st.warnings.slice();
     if (onEnemy.length) warnings.push(onEnemy.length + " banner(s) stand on enemy ground or unseen tiles (" +
       onEnemy.slice(0, 6).map((b) => b.join(",")).join(" ") + (onEnemy.length > 6 ? " …" : "") + "): the map data and this network disagree");
     return {
-      goals, captured, warnings, onEnemy,
+      goals, captured, warnings, onEnemy, cutGroups,
       kept: st.banners.filter(([x, y]) => st.existing.has(y * MAP + x)).length,
       banners: st.banners.length,
       empty: empty.filter(Boolean).length,
@@ -796,14 +1136,28 @@
     const hasEx = st.existing.size > 0;
     const mode = hasEx ? v % 3 : v % 2;
     if (mode === 1) growResources(st, opts, rand, cap);
-    if (mode === 2) seedExisting(st, opts.existing, cap);
+    const log = logOf(opts), t0 = Date.now();
+    const mine = opts.seedBanners || opts.existing || [];
+    if (mode === 2) seedExisting(st, mine, cap);
+    log("variant " + v + " (" + ["outposts first", "resources first", "from the current network"][mode] + "): start with " + st.banners.length + " banners");
     const ok = connectOutposts(st, opts, rand, v < 2 ? 0 : 1.5);
+    // the bridges may chain banners of the current network that were cut off: take them back
+    if (mode === 2) { const b0 = st.banners.length; seedExisting(st, mine, cap); log("variant " + v + ": outposts linked, " + (st.banners.length - b0) + " current banners chained again"); }
     growResources(st, opts, rand, cap);
+    if (mode === 2) seedExisting(st, mine, cap);
     const pass1 = summary(st, opts);
+    log("variant " + v + ": pass 1 " + pass1.banners + " banners, nodes " + TYPES.map((t) => pass1.nodes[t]).join("/") + " (" + (Date.now() - t0) + " ms)");
     prune(st, opts);
+    shiftEmpties(st, opts);
     const pass2 = summary(st, opts);
-    if (opts.improveMs !== 0) improve(world, st, opts, rand, opts.improveMs || 30000);
+    log("variant " + v + ": pass 2 " + pass2.banners + " banners, " + pass2.empty + " empty, cost " + pass2.cost.toFixed(2) + " (" + (Date.now() - t0) + " ms)");
+    if (opts.improveMs !== 0) {
+      const r = improve(world, st, opts, rand, opts.improveMs || 30000);
+      shiftEmpties(st, opts);
+      log("variant " + v + ": pass 3 " + r.tries + " tries, " + r.gains + " gains, " + r.sideways + " neutral, " + r.adds + " added (" + (Date.now() - t0) + " ms)");
+    }
     const s = summary(st, opts);
+    log("variant " + v + ": done, " + s.banners + " banners, " + s.empty + " empty, cost " + s.cost.toFixed(2) + ", nodes " + TYPES.map((t) => s.nodes[t]).join("/"));
     const order = buildOrder(st);
     s.design = order.map((i) => st.banners[i].slice());
     s.emptyFlags = order.map((i) => s.emptyFlags[i]);
@@ -818,8 +1172,17 @@
     return results.sort((a, b) => (a.errors.length - b.errors.length) || (a.cost - b.cost) || (a.banners - b.banners));
   }
 
+  /* Step 0 before the variants: with a pasted network, fix its cheap errors and start from that. */
+  function withRepair(world, hx, hy, opts) {
+    if (!opts.existing || !opts.existing.length || opts.repairImport === false) return { opts, repair: null };
+    const repair = repairImport(world, hx, hy, opts.existing, opts);
+    return { opts: Object.assign({}, opts, { seedBanners: repair.banners }), repair };
+  }
+
   function solve(world, hx, hy, opts, onProgress) {
     opts = opts || {};
+    const R = withRepair(world, hx, hy, opts);
+    opts = R.opts;
     const variants = opts.variants || 4;
     const results = [];
     const t0 = Date.now();
@@ -827,7 +1190,9 @@
       results.push(runVariant(world, hx, hy, opts, v));
       if (onProgress) onProgress({ variant: v + 1, of: variants, ms: Date.now() - t0 });
     }
-    return rank(results);
+    const out = rank(results);
+    out.repair = R.repair;
+    return out;
   }
 
   /* Why an HQ can't be used here (null when it can). */
@@ -848,8 +1213,8 @@
     return rows.map((r) => r.join(",")).join("\n") + "\n";
   }
 
-  const api = { solve, runVariant, rank, evaluate, toCsv, targetsOf, hqProblem, KINDS, TYPES, NODE_RATE, MAP,
-    _internal: { makeState, growResources, connectOutposts, prune, improve, analyse, field, rng, summary, check } };
+  const api = { solve, runVariant, rank, evaluate, toCsv, targetsOf, hqProblem, splitNetworks, repairImport, withRepair, KINDS, TYPES, NODE_RATE, MAP,
+    _internal: { makeState, growResources, connectOutposts, prune, improve, analyse, field, rng, summary, check, addBanner, linkB, linksHQ, shiftEmpties } };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Net = api;
 })(typeof self !== "undefined" ? self : this);

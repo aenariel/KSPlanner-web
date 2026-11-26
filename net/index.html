@@ -79,7 +79,7 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.22.1</div>
+    <div class="msg" id="version">Version 2026.11.26.1</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <details class="sec" open><summary>Your alliance</summary>
@@ -87,12 +87,23 @@
     <textarea id="csvin" placeholder="type,X,Y,label,colour,seq"></textarea>
     <label>Alliance tag <input id="tag" type="text" value="" placeholder="from the CSV"></label>
     <label class="check"><input id="othersEnemy" type="checkbox" checked> Other tags in the CSV are enemies</label>
+    <label>Ignore tags <input id="ignoreTags" type="text" value="" placeholder="e.g. OLD, NEW"></label>
+    <div class="msg" style="margin-top:0">Rows with these tags (comma-separated) are left out: not enemies, not yours. Their banners show on the map as thin outlines, as a guide.</div>
+    <label class="check"><input id="badlandOnly" type="checkbox" checked> Connect only to the Badland HQ</label>
+    <div class="msg" style="margin-top:0">Your banners that chain only to your Plains HQ are left as they are: not scored, never taken down, drawn in grey, and new banners keep off their ground. Banners chained to both stay with the Badland network.</div>
     <div class="row"><button id="loadcsv">Load CSV</button><button id="clearcsv">Clear</button></div>
     <div class="msg" id="csvmsg"></div>
     <h2>Badland HQ (lower-left tile)</h2>
     <div class="row">X <input id="hx" type="number" min="0" max="1199"> Y <input id="hy" type="number" min="0" max="1199"> <button id="go">Set</button></div>
     <div class="msg" id="hqmsg">Type the coordinates, load a CSV, or pick "HQ" below and click the map.</div>
     </details>
+
+    <div id="current" hidden>
+      <details class="sec" open><summary>Current network (from the CSV)</summary>
+      <div class="stats" id="curstats"></div>
+      <div id="curfix"></div>
+      <label class="check"><input id="showcur" type="checkbox"> Show it on the map on its own, instead of the result</label></details>
+    </div>
 
     <details class="sec" open><summary>Click on the map</summary>
     <div class="modes">
@@ -146,8 +157,10 @@
     <label>An empty banner costs (banners) <input id="ew" type="number" value="1.5" min="1" max="5" step="0.1"></label>
     <label>A banner you already have costs (banners) <input id="exc" type="number" value="0.5" min="0" max="1" step="0.1"></label>
     <div class="msg">Banners of the pasted CSV's network. Below 1 the networks keep them where they can; one variant in three starts from the current network. 1 = no preference.</div>
+    <label>A node above the minimum is worth (banners) <input id="sv" type="number" value="0.5" min="0" max="2" step="0.1"></label>
+    <div class="msg">The minimums are a floor, more is a bonus: at 0.5, two extra nodes are worth one banner. A banner is only taken away when that saves more than the nodes it holds are worth, and empty banners move next door when that completes a node. 0 = above the minimum nothing counts.</div>
     <label>Banner limit <input id="cap" type="number" value="285" min="20" max="285"></label>
-    <div class="msg">Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search time, which keeps lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
+    <div class="msg">First, with a pasted network, step 0 fixes its cheap errors (a banner moved up to 2 tiles, or one new banner as a bridge) and the variants start from the fixed network. Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search time, which keeps lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
     </details>
 
     <button class="primary" id="run" disabled>Design network</button>
@@ -166,11 +179,6 @@
       <textarea id="csv" readonly></textarea>
       <div class="row" style="margin-top:6px"><button id="copy">Copy CSV</button><button id="dl">Download</button><span class="msg" id="copymsg"></span></div></details>
     </div>
-    <div id="current" hidden>
-      <details class="sec"><summary>Current network (from the CSV)</summary>
-      <div class="stats" id="curstats"></div>
-      <label class="check"><input id="showcur" type="checkbox"> Show it on the map on its own, instead of the result</label></details>
-    </div>
 
     <details class="sec"><summary>Legend</summary>
     <div class="legend">
@@ -188,7 +196,9 @@
       <div class="sw" style="background:rgba(231,76,60,.45)"></div><div>Enemy territory (banner 7x7, HQ 15x15, or a scan piece tile by tile)</div>
       <div class="sw" style="background:rgba(120,165,230,.35)"></div><div>Scan piece switched off (your own, or by hand)</div>
       <div class="sw" style="background:rgba(150,150,150,.55)"></div><div>Unseen tile in the scan (strong grey: counted as enemy ground; light grey: taken as free)</div>
-      <div class="sw" style="background:#7f8c8d;border:1px solid #2c3e50"></div><div>Current network (from the CSV)</div>
+      <div class="sw" style="background:#9aa3ad;border:1px solid #4a5260"></div><div>Your Plains HQ's network, left as it is ("Connect only to the Badland HQ")</div>
+      <div class="sw" style="background:transparent;border:1px solid #d0d4da"></div><div>Banner of an ignored tag (guide only)</div>
+      <div class="sw" style="background:transparent;border:2px solid #22d3ee"></div><div>Step 0 fix: where a CSV banner moves, or the new bridge banner</div>
       <div class="sw" style="background:linear-gradient(90deg,#deba46 25%,#346e30 25% 50%,#cccccc 50% 75%,#965032 75%)"></div><div>Resource nodes (bread, wood, stone, iron)</div>
       <div class="sw" style="background:rgb(112,102,90)"></div><div>Mountain</div>
       <div class="sw" style="background:rgb(96,132,170)"></div><div>Lake</div>
