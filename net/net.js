@@ -777,6 +777,105 @@
     for (const [x, y] of banners) addBanner(st, x, y, null);
   }
 
+  /* Nodes not yet captured inside `area` that one more banner, linked to the network, would
+     complete; and the tiles of banner i's square that other squares also cover. */
+  function reachIn(st, area) {
+    const F = field(st, [area[0] - 8, area[1] - 8, area[2] + 8, area[3] + 8], 1);
+    let n = 0;
+    for (const nd of st.P.nodes) {
+      if (st.full[nd.i] || nd.x < area[0] || nd.y < area[1] || nd.x > area[2] || nd.y > area[3]) continue;
+      const sp = nodeSpots(st, F, nd);
+      if (sp && sp.lvl === 1) n++;
+    }
+    return n;
+  }
+  function overlapOf(st, x, y) {
+    let n = 0;
+    for (let yy = Math.max(0, y - 3); yy <= Math.min(MAP - 1, y + 3); yy++) for (let xx = Math.max(0, x - 3); xx <= Math.min(MAP - 1, x + 3); xx++) if (st.cov[yy * MAP + xx] > 1) n++;
+    return n;
+  }
+  // whole-network figures, for reports and tests
+  function spreadMetrics(st) {
+    let overlap = 0;
+    for (const [x, y] of st.banners) overlap += overlapOf(st, x, y);
+    return { overlap, reach: reachIn(st, netBox(st)) };
+  }
+
+  /* Last touch (Pedro, 26 Nov): each new banner may move up to maxD tiles when the network loses
+     nothing (no errors, same or lower cost) and the new spot leaves more uncaptured nodes within
+     reach of one more banner, or as many with less overlap with the other squares. Banners already
+     built stay where they are. */
+  function spreadNew(st, opts, maxD, near) {
+    maxD = maxD || 3;
+    // with `near` (tile indices that changed), only the new banners within 10 tiles of them
+    const nearPts = near ? [...near].map((c) => [c % MAP, (c / MAP) | 0]) : null;
+    const log = logOf(opts), t0 = Date.now();
+    const c0 = check(st, opts);
+    if (c0.errors.length) return 0;
+    let cost = costOf(st, c0.A, opts);
+    const before = opts.verbose ? spreadMetrics(st) : null;
+    let moves = 0, tried = 0;
+    const better = (a, b) => a.reach > b.reach || (a.reach === b.reach && a.overlap < b.overlap);
+    for (let pass = 0; pass < 2; pass++) {
+      let any = false;
+      for (let i = 0; i < st.banners.length; i++) {
+        const [x, y] = st.banners[i];
+        if (st.existing.has(y * MAP + x)) continue;
+        if (nearPts && !nearPts.some(([px, py]) => Math.abs(px - x) <= 10 && Math.abs(py - y) <= 10)) continue;
+        const area = [x - maxD - 12, y - maxD - 12, x + maxD + 12, y + maxD + 12];
+        let bestS = { reach: reachIn(st, area), overlap: overlapOf(st, x, y) }, best = null, bestCost = cost;
+        for (let dy = -maxD; dy <= maxD; dy++) for (let dx = -maxD; dx <= maxD; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if ((!dx && !dy) || nx < 0 || ny < 0 || nx >= MAP || ny >= MAP || !placeable(st, ny * MAP + nx)) continue;
+          moveBanner(st, i, nx, ny);
+          // it must still link to something
+          if (linksHQ(st, nx, ny) || st.banners.some(([bx, by], j) => j !== i && linkB(st, bx, by, nx, ny))) {
+            const sc = { reach: reachIn(st, area), overlap: overlapOf(st, nx, ny) };
+            if (better(sc, bestS)) {
+              tried++;
+              const c = check(st, opts);
+              const nc = c.errors.length ? 1e9 : costOf(st, c.A, opts);
+              if (nc <= cost + 1e-9) { best = [nx, ny]; bestS = sc; bestCost = nc; }
+            }
+          }
+          moveBanner(st, i, x, y);
+        }
+        if (best) { moveBanner(st, i, best[0], best[1]); cost = bestCost; moves++; any = true; }
+      }
+      if (!any) break;
+    }
+    if (before) { const after = spreadMetrics(st); log("spread: " + moves + " new banners moved (" + tried + " checked), overlap " + before.overlap + " -> " + after.overlap + " tiles, nodes within one more banner " + before.reach + " -> " + after.reach + ", " + (Date.now() - t0) + " ms"); }
+    return moves;
+  }
+
+  /* Back to pass 1 from the finished network (Pedro, 26 Nov: "volto ao passo 1"): spread the new
+     banners, grow resource chains from the network as it now stands (its moved banners are new
+     places to grow from), prune, a short local search; kept when the cost drops, else back to the
+     best. Repeats until tEnd. */
+  function cycles(world, st, opts, rand, tEnd, cap, log) {
+    const quiet = Object.assign({}, opts, { verbose: false });
+    let best = snapshot(st), bestCost = costOf(st, analyse(st), opts);
+    let n = 0, kept = 0;
+    const t0 = Date.now();
+    while (Date.now() < tEnd - 1500) {
+      n++;
+      if (opts.spread !== false) spreadNew(st, quiet);
+      const b0 = st.banners.length;
+      growResources(st, opts, rand, cap);
+      const grown = st.banners.length - b0;
+      prune(st, opts);
+      shiftEmpties(st, quiet);
+      const left = tEnd - Date.now();
+      if (left > 300) improve(world, st, quiet, rand, Math.max(300, Math.min(left, Math.round((opts.improveMs || 30000) * 0.2))));
+      const c = check(st, opts);
+      const nc = c.errors.length ? 1e9 : costOf(st, c.A, opts);
+      log("cycle " + n + ": grew " + grown + " banners, back to " + st.banners.length + ", cost " + (nc >= 1e9 ? "errors" : nc.toFixed(2)) + " (best " + bestCost.toFixed(2) + ")");
+      if (nc < bestCost - 1e-9) { bestCost = nc; best = snapshot(st); kept++; }
+      else resetTo(st, best);
+    }
+    log("cycles: " + n + " run, " + kept + " kept, best cost " + bestCost.toFixed(2) + ", " + (Date.now() - t0) + " ms");
+  }
+
   // ---------------------------------------------------------------- pass 3: local search
   /* Two moves, in rounds, for the time given:
      1. take one banner away with whatever it cuts off (a whole arm when it is a link), re-link what
@@ -788,7 +887,9 @@
      arm give way to another (A loses 4 banners and 3 wood, B gains 5 banners, 3 wood and 2 stone)
      before the next move cashes in the extra (the stone lets a third arm shrink). The best network
      seen is the one kept. */
-  function improve(world, st, opts, rand, budgetMs) {
+  /* budget: { tries } (a fixed number of tries: the same network on any machine) or, for older
+     callers, a number of milliseconds. */
+  function improve(world, st, opts, rand, budget) {
     const t0 = Date.now(), log = logOf(opts);
     const T = targetsOf(opts);
     const sigOf = () => st.banners.map(([x, y]) => y * MAP + x).sort((a, b) => a - b).join(",");
@@ -796,9 +897,10 @@
     let best = { cost, banners: snapshot(st) };
     const seen = new Set([sigOf()]);
     const maxSide = opts.sidewaysSteps != null ? opts.sidewaysSteps : 25;
-    const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0 };
+    const stats = { tries: 0, gains: 0, sideways: 0, addTries: 0, adds: 0, rounds: 0, spread: 0 };
+    let lastSpread = new Set(st.banners.map(([x, y]) => y * MAP + x));
     let side = 0;
-    const out = () => Date.now() - t0 > budgetMs;
+    const out = typeof budget === "object" ? () => stats.tries + stats.addTries >= budget.tries : () => Date.now() - t0 > budget;
     // keep the state as it is now? (cost already checked: no errors)
     const accept = (nc) => {
       if (nc < cost - 1e-9) return "gain";
@@ -813,9 +915,13 @@
     const evalNow = () => { const c = check(st, opts); return c.errors.length ? null : costOf(st, c.A, opts); };
     for (let changed = true; changed && !out();) {
       changed = false; stats.rounds++;
-      // move 1: an arm away, re-linked locally
+      // move 1: an arm away, re-linked locally (move 2 also runs every 40 tries: a round can take
+      // the whole time on a big network)
+      const addMove = () => addOne(st, opts, rand, out, (nc) => { const k = accept(nc); if (k) { took(k, nc); stats.adds++; } return !!k; }, stats);
+      let sinceAdd = 0;
       for (const i of st.banners.map((_, k) => k).sort(() => rand() - 0.5)) {
         if (out()) break;
+        if (++sinceAdd >= 40) { sinceAdd = 0; if (addMove()) changed = true; if (out()) break; }
         if (i >= st.banners.length) continue;
         stats.tries++;
         const before = snapshot(st);
@@ -832,13 +938,29 @@
         if (k) { took(k, nc); changed = true; } else resetTo(st, before);
       }
       // move 2: one banner more where it completes nodes, then prune
-      if (!out() && addOne(st, opts, rand, out, (nc) => { const k = accept(nc); if (k) { took(k, nc); stats.adds++; } return !!k; }, stats)) changed = true;
+      if (!out() && addMove()) changed = true;
+      // move 3: new banners near what changed this round spread out (less overlap, more nodes within
+      // reach of one more banner), never at a cost; the next round's moves can use what that opens
+      if (!out() && opts.spread !== false && opts.spreadInSearch) {
+        const now = new Set(st.banners.map(([x, y]) => y * MAP + x)), diff = new Set();
+        for (const c of now) if (!lastSpread.has(c)) diff.add(c);
+        for (const c of lastSpread) if (!now.has(c)) diff.add(c);
+        if (diff.size) {
+          const moved = spreadNew(st, Object.assign({}, opts, { verbose: false }), 3, diff);
+          if (moved) {
+            stats.spread += moved; changed = true;
+            cost = costOf(st, analyse(st), opts); seen.add(sigOf());
+            if (cost < best.cost - 1e-9) best = { cost, banners: snapshot(st) };
+          }
+        }
+        lastSpread = new Set(st.banners.map(([x, y]) => y * MAP + x));
+      }
     }
     if (best.cost < cost - 1e-9) resetTo(st, best.banners);
     const ms = Date.now() - t0;
     log("pass 3: " + stats.rounds + " round(s), " + stats.tries + " arm tries (" + stats.gains + " gains, " + stats.sideways + " neutral steps), " +
-      stats.addTries + " one-more tries (" + stats.adds + " kept), best cost " + best.cost.toFixed(2) + ", " + ms + " ms");
-    return { tries: stats.tries + stats.addTries, gains: stats.gains, sideways: stats.sideways, adds: stats.adds, ms };
+      stats.addTries + " one-more tries (" + stats.adds + " kept), " + stats.spread + " banners spread, best cost " + best.cost.toFixed(2) + ", " + ms + " ms");
+    return { tries: stats.tries + stats.addTries, gains: stats.gains, sideways: stats.sideways, adds: stats.adds, spread: stats.spread, ms };
   }
 
   /* Move 2 of the local search: every free tile one link away from the network whose square
@@ -1149,14 +1271,24 @@
     log("variant " + v + ": pass 1 " + pass1.banners + " banners, nodes " + TYPES.map((t) => pass1.nodes[t]).join("/") + " (" + (Date.now() - t0) + " ms)");
     prune(st, opts);
     shiftEmpties(st, opts);
+    // spread the new banners before the search, so its moves start from what that opens
+    if (opts.spread !== false && opts.spreadInSearch) spreadNew(st, opts);
     const pass2 = summary(st, opts);
     log("variant " + v + ": pass 2 " + pass2.banners + " banners, " + pass2.empty + " empty, cost " + pass2.cost.toFixed(2) + " (" + (Date.now() - t0) + " ms)");
-    if (opts.improveMs !== 0) {
-      const r = improve(world, st, opts, rand, opts.improveMs || 30000);
+    // pass 3 budget: opts.improveTries (default 600), or opts.improveMs for older callers
+    const tries = opts.improveTries != null ? opts.improveTries : (opts.improveMs != null ? null : 600);
+    if (tries !== 0 && opts.improveMs !== 0) {
+      const total = opts.improveMs || 30000, tEnd = Date.now() + total;
+      // cycles back to pass 1: only with a time budget, off by default (worse at 15-30 s)
+      const useCycles = !!opts.cycles && tries == null;
+      const r = improve(world, st, opts, rand, tries != null ? { tries } : useCycles ? Math.round(total * 0.4) : total);
       shiftEmpties(st, opts);
       log("variant " + v + ": pass 3 " + r.tries + " tries, " + r.gains + " gains, " + r.sideways + " neutral, " + r.adds + " added (" + (Date.now() - t0) + " ms)");
+      if (useCycles) cycles(world, st, opts, rand, tEnd, cap, (m) => log("variant " + v + ": " + m));
     }
+    if (opts.spread !== false) spreadNew(st, opts);
     const s = summary(st, opts);
+    s.spread = spreadMetrics(st);
     log("variant " + v + ": done, " + s.banners + " banners, " + s.empty + " empty, cost " + s.cost.toFixed(2) + ", nodes " + TYPES.map((t) => s.nodes[t]).join("/"));
     const order = buildOrder(st);
     s.design = order.map((i) => st.banners[i].slice());
@@ -1202,7 +1334,9 @@
     return null;
   }
 
-  function toCsv(hq, design, emptyFlags, tag, existing) {
+  /* KSMapper CSV in build order; with `removed` (banners of the current network taken down), those
+     are added at the end under `oldTag`, in red. */
+  function toCsv(hq, design, emptyFlags, tag, existing, removed, oldTag) {
     const have = new Set((existing || []).map(([x, y]) => x + "," + y));
     const rows = [["hq", hq[0], hq[1], tag, "#8e44ad", 1]];
     design.forEach(([x, y], i) => {
@@ -1210,11 +1344,12 @@
       const col = built ? (emptyFlags[i] ? "#80ff00" : "#80ff80") : (emptyFlags[i] ? "#ffff00" : "#ffff80");
       rows.push(["banner", x, y, tag, col, i + 2]);
     });
+    if (removed && removed.length) removed.forEach(([x, y], k) => rows.push(["banner", x, y, oldTag || "OLD", "#ff3030", design.length + 2 + k]));
     return rows.map((r) => r.join(",")).join("\n") + "\n";
   }
 
   const api = { solve, runVariant, rank, evaluate, toCsv, targetsOf, hqProblem, splitNetworks, repairImport, withRepair, KINDS, TYPES, NODE_RATE, MAP,
-    _internal: { makeState, growResources, connectOutposts, prune, improve, analyse, field, rng, summary, check, addBanner, linkB, linksHQ, shiftEmpties } };
+    _internal: { makeState, growResources, connectOutposts, prune, improve, analyse, field, rng, summary, check, addBanner, linkB, linksHQ, shiftEmpties, spreadNew, spreadMetrics } };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Net = api;
 })(typeof self !== "undefined" ? self : this);

@@ -79,7 +79,7 @@
 <div id="app">
   <div id="side">
     <h1>Banner network</h1>
-    <div class="msg" id="version">Version 2026.11.26.1</div>
+    <div class="msg" id="version">Version 2026.11.26.2</div>
     <div class="msg" id="loadmsg">Loading map…</div>
 
     <details class="sec" open><summary>Your alliance</summary>
@@ -153,14 +153,15 @@
 
     <details class="sec"><summary>Search</summary>
     <label>Variants <input id="variants" type="number" value="4" min="1" max="16"></label>
-    <label>Search time per variant (s) <input id="secs" type="number" value="30" min="0" max="600"></label>
+    <label>Search tries per variant <input id="tries" type="number" value="600" min="0" max="20000" step="100"></label>
+    <div class="msg">A fixed number of tries, so the same settings give the same networks on any machine. About 0.05 s a try on a PC (600 ≈ 30 s), slower with a scan mask or on a phone.</div>
     <label>An empty banner costs (banners) <input id="ew" type="number" value="1.5" min="1" max="5" step="0.1"></label>
     <label>A banner you already have costs (banners) <input id="exc" type="number" value="0.5" min="0" max="1" step="0.1"></label>
     <div class="msg">Banners of the pasted CSV's network. Below 1 the networks keep them where they can; one variant in three starts from the current network. 1 = no preference.</div>
     <label>A node above the minimum is worth (banners) <input id="sv" type="number" value="0.5" min="0" max="2" step="0.1"></label>
     <div class="msg">The minimums are a floor, more is a bonus: at 0.5, two extra nodes are worth one banner. A banner is only taken away when that saves more than the nodes it holds are worth, and empty banners move next door when that completes a node. 0 = above the minimum nothing counts.</div>
     <label>Banner limit <input id="cap" type="number" value="285" min="20" max="285"></label>
-    <div class="msg">First, with a pasted network, step 0 fixes its cheap errors (a banner moved up to 2 tiles, or one new banner as a bridge) and the variants start from the fixed network. Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search time, which keeps lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
+    <div class="msg">First, with a pasted network, step 0 fixes its cheap errors (a banner moved up to 2 tiles, or one new banner as a bridge) and the variants start from the fixed network. Each variant: about 4 s to build the network with the most resources, under 0.1 s to take away what isn't needed, then the search tries, which keep lowering the count. The variants run side by side on up to 4 cores (one left free).</div>
     </details>
 
     <button class="primary" id="run" disabled>Design network</button>
@@ -175,7 +176,8 @@
       <details class="sec"><summary>Outposts reached</summary>
       <table id="goals"></table></details>
       <details class="sec"><summary>KSMapper CSV (build order)</summary>
-      <div class="msg">Same colours as the map: green, already built; yellow, to build; light shade captures resources, strong shade is empty. Banners taken down are not in it. Import it into an empty KSMapper map (the tag clashes with your own network).</div>
+      <div class="msg">Same colours as the map: green, already built; yellow, to build; light shade captures resources, strong shade is empty. Import it into an empty KSMapper map (the tag clashes with your own network).</div>
+      <label class="check"><input id="exportOld" type="checkbox"> Add the banners taken down, in red, with the tag <input id="oldTag" type="text" value="OLD" style="width:70px;margin-left:6px"></label>
       <textarea id="csv" readonly></textarea>
       <div class="row" style="margin-top:6px"><button id="copy">Copy CSV</button><button id="dl">Download</button><span class="msg" id="copymsg"></span></div></details>
     </div>

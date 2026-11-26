@@ -769,7 +769,7 @@ function options() {
     enemies: enemies.map((e) => ({ type: e.type, x: e.x, y: e.y })).concat(plainsGround()),
     mask: scanR && scanR.runs.length ? { key: scanR.key, runs: scanR.runs } : null,
     variants: Math.max(1, Math.min(16, Math.round(num("variants", 4)))),
-    improveMs: Math.max(0, Math.round(num("secs", 30) * 1000)),
+    improveTries: Math.max(0, Math.round(num("tries", 600))),
     emptyWeight: Math.max(0, num("ew", 1.5) - 1),
     existing: own.banners.slice(), existingCost: Math.max(0, Math.min(1, num("exc", 0.5))),
     surplusValue: Math.max(0, num("sv", 0.5)), verbose: true,
@@ -815,7 +815,8 @@ $("run").onclick = () => {
   $("run").disabled = true; $("prog").style.width = "0";
   const t0 = Date.now();
   let workers = 1, done = 0;
-  const estimate = () => Math.ceil(opts.variants / workers) * (opts.improveMs / 1000 + 5);
+  // about 0.05 s a try on a PC (slower with a scan mask or on a phone), plus ~5 s to build
+  const estimate = () => Math.ceil(opts.variants / workers) * (opts.improveTries * 0.05 * (opts.mask ? 2 : 1) + 5);
   const tick = () => {
     const el = (Date.now() - t0) / 1000, est = estimate();
     $("prog").style.width = Math.min(98, Math.round(el / est * 100)) + "%";
@@ -935,11 +936,24 @@ function pick(i) {
   const d = results[i];
   $("stats").innerHTML = statsHtml(d, current && own.banners.length ? current : null);
   $("goals").innerHTML = "<tr><th>Kind</th><th>Outpost</th></tr>" + d.goals.map((g) => "<tr><td>" + g.kind + (g.forced ? ' <span class="ok">forced</span>' : "") + "</td><td>" + (g.met ? g.at.map(key).join(", ") : '<span class="err">not reached</span>') + "</td></tr>").join("");
-  $("csv").value = Net.toCsv(hq, d.design, d.emptyFlags, own.tag || $("tag").value || "NET", own.banners);
+  csvOut();
   $("showcur").checked = false;
   terrCache.ref = null;
   draw();
 }
+/* The selected network as a KSMapper CSV; with "Add the banners taken down", the current network's
+   banners it drops follow at the end under their own tag, in red. */
+function csvOut() {
+  const d = results[sel];
+  if (!d) return;
+  const mine = new Set(d.design.map(key));
+  const removed = $("exportOld").checked ? own.banners.filter((b) => !mine.has(key(b))) : null;
+  const oldTag = $("oldTag").value.trim() || "OLD";
+  $("csv").value = Net.toCsv(hq, d.design, d.emptyFlags, own.tag || $("tag").value || "NET", own.banners, removed, oldTag);
+  $("copymsg").textContent = removed ? removed.length + " banner(s) taken down added as " + oldTag + "." : "";
+}
+$("exportOld").addEventListener("change", csvOut);
+$("oldTag").addEventListener("input", csvOut);
 function showCurrent() {
   if (!current) return;
   $("current").hidden = false;
